@@ -13,18 +13,21 @@ with lib; let
     then config.networking.hostName
     else cfg.systemName;
 
-  # One rendering of every setting, shared by the daemon unit, the launcher entry
-  # and the tray entry, so no binary can be launched with a partial set.
-  cliFlags = concatStringsSep " " (
-    [
-      "--flake-uri=${cfg.flakeUri}"
-      "--system-name=${systemName}"
-      "--use-nom=${boolToString cfg.useNom}"
-      "--auto-notify=${boolToString cfg.autoNotify}"
-      "--check-interval=${cfg.checkInterval}"
-      "--bus-name=${cfg.busName}"
-    ]
-  );
+  # Values are quoted because these flags end up in the Exec line of a desktop
+  # entry, where the Desktop Entry Specification lists ?, #, and & as reserved
+  # characters. Flake URIs use them, for example git+https://host/repo?ref=main.
+  flag = name: value: "--${name}=\"${value}\"";
+
+  # One rendering of every setting, shared by the launcher entry and the tray
+  # entry, so no binary can be launched with a partial set.
+  cliFlags = concatStringsSep " " [
+    (flag "flake-uri" cfg.flakeUri)
+    (flag "system-name" systemName)
+    (flag "use-nom" (boolToString cfg.useNom))
+    (flag "auto-notify" (boolToString cfg.autoNotify))
+    (flag "check-interval" cfg.checkInterval)
+    (flag "bus-name" cfg.busName)
+  ];
 
   # Booleans are always written out, including when false, because both binaries
   # fall back to true when a variable is absent.
