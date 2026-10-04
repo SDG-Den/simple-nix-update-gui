@@ -1,3 +1,0 @@
-[workspace]
-members = ["gui", "daemon"]
-resolver = "2"
