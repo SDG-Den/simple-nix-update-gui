@@ -16,6 +16,6 @@ Welcome to the Simple Nix Update GUI documentation.
 2. Enable `services.simple-nix-update-gui.enable = true`
 3. Set `flakeUri` to point to your system flake
 4. Rebuild and switch
-5. Launch the GUI or wait for notifications from the daemon
+5. Launch the GUI from the launcher, or use the tray icon that autostarts with the session
 
 For detailed setup instructions, see [Installation](installation.md). For configuration options, see [Configuration](configuration.md).

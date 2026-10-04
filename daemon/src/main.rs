@@ -1,9 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tracing::{error, info, warn};
 use zbus::{dbus_interface, ConnectionBuilder};
 
@@ -17,8 +16,12 @@ struct Args {
     system_name: Option<String>,
     #[arg(long, env = "SNU_CHECK_INTERVAL", default_value = "1h")]
     check_interval: String,
-    #[arg(long, env = "SNU_AUTO_NOTIFY", env = "SNU_AUTO_NOTIFY", default_value = "true")]
-    auto_notify: bool,
+    #[arg(
+        long,
+        env = "SNU_BUS_NAME",
+        default_value = "org.simple_nix_update_gui.Daemon"
+    )]
+    bus_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,9 +47,6 @@ impl Daemon {
         match check_updates(&self.args).await {
             Ok(new_state) => {
                 *self.state.write().await = new_state.clone();
-                if new_state.has_update && self.args.auto_notify {
-                    let _ = notify_update_available(&new_state);
-                }
                 serde_json::to_string(&new_state).unwrap_or_else(|_| "{}".to_string())
             }
             Err(e) => {
@@ -96,7 +96,10 @@ async fn check_updates(args: &Args) -> Result<UpdateState> {
         None => get_hostname().await,
     };
 
-    info!("Checking for updates: flake={}#{}", args.flake_uri, system_name);
+    info!(
+        "Checking for updates: flake={}#{}",
+        args.flake_uri, system_name
+    );
 
     let eval_cmd = format!(
         "{}#nixosConfigurations.{}.system",
@@ -142,21 +145,6 @@ async fn check_updates(args: &Args) -> Result<UpdateState> {
     })
 }
 
-async fn notify_update_available(state: &UpdateState) -> Result<()> {
-    let msg = format!(
-        "Update available for {} ({})",
-        state.system_name, state.flake_uri
-    );
-    let _ = notify_rust::Notification::new()
-        .summary("System Updates")
-        .body(&msg)
-        .action("show", "Show Updates")
-        .icon("system-software-update")
-        .timeout(notify_rust::Timeout::Milliseconds(10000))
-        .show();
-    Ok(())
-}
-
 async fn is_reboot_needed() -> Result<bool> {
     let booted = Command::new("readlink")
         .arg("/run/booted-system")
@@ -179,36 +167,40 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let initial_state = check_updates(&args).await.unwrap_or_else(|e| {
-        error!("Initial check failed: {}", e);
-        UpdateState {
+    // The name is taken before the first nix eval. Under Type=dbus systemd waits
+    // for the name, and a cold eval of a large flake can outlast that wait.
+    let daemon = Daemon {
+        state: std::sync::Arc::new(tokio::sync::RwLock::new(UpdateState {
             has_update: false,
             current_system: "unknown".to_string(),
             remote_system: None,
             last_check: chrono::Local::now().to_rfc3339(),
             flake_uri: args.flake_uri.clone(),
-            system_name: args.system_name.clone().unwrap_or_else(|| "unknown".to_string()),
-        }
-    });
-
-    if initial_state.has_update && args.auto_notify {
-        let _ = notify_update_available(&initial_state);
-    }
-
-    let daemon = Daemon {
-        state: std::sync::Arc::new(tokio::sync::RwLock::new(initial_state)),
+            system_name: args
+                .system_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        })),
         args: args.clone(),
     };
 
-    let _conn = ConnectionBuilder::session()?
-        .name("org.simple_nix_update_gui.Daemon")?
+    let _conn = ConnectionBuilder::system()?
+        .name(args.bus_name.clone())?
         .serve_at("/org/simple_nix_update_gui/Daemon", daemon.clone())?
         .build()
         .await?;
 
+    let initial_state = match check_updates(&args).await {
+        Ok(state) => state,
+        Err(e) => {
+            error!("Initial check failed: {}", e);
+            daemon.state.read().await.clone()
+        }
+    };
+    *daemon.state.write().await = initial_state;
+
     // Periodic checks
-    let mut interval_str = args.check_interval.clone();
-    let duration = parse_duration(&mut interval_str).unwrap_or(Duration::from_secs(3600));
+    let duration = parse_duration(&args.check_interval).unwrap_or(Duration::from_secs(3600));
     let mut check_interval = tokio::time::interval(duration);
 
     loop {
@@ -216,12 +208,7 @@ async fn main() -> Result<()> {
         info!("Periodic update check");
         match check_updates(&args).await {
             Ok(new_state) => {
-                let mut state = daemon.state.write().await;
-                let had_update = state.has_update;
-                *state = new_state.clone();
-                if new_state.has_update && !had_update && args.auto_notify {
-                    let _ = notify_update_available(&new_state);
-                }
+                *daemon.state.write().await = new_state;
             }
             Err(e) => {
                 error!("Periodic check failed: {}", e);
@@ -238,7 +225,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
     let bytes = s.as_bytes();
     let (num_part, unit_part) = bytes
         .iter()
-        .position(|&b| b < b'0' || b > b'9')
+        .position(|&b| !b.is_ascii_digit())
         .map(|pos| s.split_at(pos))
         .unwrap_or((s, ""));
     let num: u64 = num_part.trim().parse().ok()?;

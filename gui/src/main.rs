@@ -1,15 +1,23 @@
 use anyhow::Result;
-use clap::Parser;
-use gtk4::prelude::*;
-use gtk4::{self, ApplicationWindow, Box, Button, Dialog, Label, Orientation, ScrolledWindow};
+use clap::{ArgAction, Parser};
+use gtk4::{self, glib, Box as GtkBox, Button, Dialog, Label, Orientation, ScrolledWindow};
+use ksni::{Category, Status, TrayMethods};
 use libadwaita::prelude::*;
-use libadwaita::Application as AdwApplication;
+use libadwaita::{
+    Application as AdwApplication, ApplicationWindow, Banner, HeaderBar, ToolbarView,
+};
 use serde::{Deserialize, Serialize};
-use std::env;
+use std::cell::RefCell;
 use std::process::Command;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use vte4::prelude::*;
-use vte4::{Terminal, PtyFlags};
-use chrono;
+use vte4::{PtyFlags, Terminal};
+
+const ICON_NAME: &str = "system-software-update";
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "simple-nix-update-gui")]
@@ -19,8 +27,32 @@ struct Args {
     flake_uri: Option<String>,
     #[arg(long, env = "SNU_SYSTEM_NAME")]
     system_name: Option<String>,
-    #[arg(long, env = "SNU_USE_NOM", default_value = "true")]
+    #[arg(
+        long,
+        env = "SNU_USE_NOM",
+        action = ArgAction::Set,
+        value_parser = clap::value_parser!(bool),
+        default_value_t = true
+    )]
     use_nom: bool,
+    #[arg(long, env = "SNU_CHECK_INTERVAL", default_value = "1h")]
+    check_interval: String,
+    #[arg(
+        long,
+        env = "SNU_AUTO_NOTIFY",
+        action = ArgAction::Set,
+        value_parser = clap::value_parser!(bool),
+        default_value_t = true
+    )]
+    auto_notify: bool,
+    #[arg(
+        long,
+        env = "SNU_BUS_NAME",
+        default_value = "org.simple_nix_update_gui.Daemon"
+    )]
+    bus_name: String,
+    #[arg(long)]
+    tray: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,85 +65,251 @@ struct UpdateState {
     system_name: String,
 }
 
-fn get_hostname() -> String {
-    hostname::get()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string()
+/// What background tasks ask the GTK thread to do. The GTK thread owns every
+/// widget and the background tasks own none, so this channel is the only thing
+/// that crosses between them.
+enum UiAction {
+    State(Box<UpdateState>),
+    DaemonDown(String),
+    OpenWindow,
+    CheckNow,
+    Quit,
 }
 
-#[tokio::main]
+struct UpdateTray {
+    has_update: Arc<AtomicBool>,
+    actions: UnboundedSender<UiAction>,
+}
+
+impl ksni::Tray for UpdateTray {
+    fn id(&self) -> String {
+        "simple-nix-update-gui".into()
+    }
+
+    fn icon_name(&self) -> String {
+        ICON_NAME.into()
+    }
+
+    fn title(&self) -> String {
+        if self.has_update.load(Ordering::Relaxed) {
+            "Updates available".into()
+        } else {
+            "Up to date".into()
+        }
+    }
+
+    fn status(&self) -> Status {
+        if self.has_update.load(Ordering::Relaxed) {
+            Status::NeedsAttention
+        } else {
+            Status::Active
+        }
+    }
+
+    fn category(&self) -> Category {
+        Category::SystemServices
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.actions.send(UiAction::OpenWindow);
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::*;
+        let menu: Vec<ksni::MenuItem<Self>> = vec![
+            StandardItem {
+                label: "Open".into(),
+                icon_name: "window-new".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.actions.send(UiAction::OpenWindow);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Check now".into(),
+                icon_name: "view-refresh".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.actions.send(UiAction::CheckNow);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "Quit".into(),
+                icon_name: "application-exit".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.actions.send(UiAction::Quit);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ];
+        menu
+    }
+}
+
+/// The single window, kept alive for the whole process so that closing it in
+/// tray mode hides it instead of destroying it.
+struct Window {
+    window: ApplicationWindow,
+    banner: Banner,
+    current_label: Label,
+    remote_label: Label,
+    status_label: Label,
+    last_check_label: Label,
+    update_button: Button,
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    let flake_uri = args
+        .flake_uri
+        .clone()
+        .unwrap_or_else(|| "path:/etc/nixos".to_string());
+    let system_name = args.system_name.clone().unwrap_or_else(get_hostname);
 
-    let flake_uri = args.flake_uri.clone().unwrap_or_else(|| {
-        env::var("SNU_FLAKE_URI").unwrap_or_else(|_| "path:/etc/nixos".to_string())
-    });
-    let system_name = args.system_name.clone().unwrap_or_else(|| {
-        env::var("SNU_SYSTEM_NAME").unwrap_or_else(|_| get_hostname())
-    });
-    let use_nom = args.use_nom;
-
-    // Get state from daemon if available
-    let state = get_daemon_state().await.unwrap_or_else(|_| UpdateState {
-        has_update: false,
-        current_system: get_current_system().unwrap_or_else(|_| "unknown".to_string()),
-        remote_system: None,
-        last_check: chrono::Local::now().to_rfc3339(),
-        flake_uri: flake_uri.clone(),
-        system_name: system_name.clone(),
-    });
+    let (actions_tx, actions_rx) = unbounded_channel::<UiAction>();
+    let (check_tx, check_rx) = unbounded_channel::<()>();
 
     let app = AdwApplication::new(Some("org.simple_nix_update_gui"), Default::default());
-    let flake_uri_clone = flake_uri.clone();
-    let system_name_clone = system_name.clone();
-    let state_clone = state.clone();
-    let use_nom_clone = use_nom;
+    // In tray mode the process has to outlive its window, and the guard has to
+    // stay alive for as long as it does.
+    let _hold_guard = if args.tray { Some(app.hold()) } else { None };
 
-    app.connect_activate(move |app| {
-        build_ui(
-            app,
-            &flake_uri_clone,
-            &system_name_clone,
-            &state_clone,
-            use_nom_clone,
-        );
+    let tray_handle = if args.tray {
+        let tray = UpdateTray {
+            has_update: Arc::new(AtomicBool::new(false)),
+            actions: actions_tx.clone(),
+        };
+        let handle = tray.spawn().await?;
+        let keeper = handle.clone();
+        tokio::spawn(async move {
+            let _keeper = keeper;
+            std::future::pending::<()>().await;
+        });
+        Some(handle)
+    } else {
+        None
+    };
+
+    spawn_poller(args.clone(), actions_tx.clone(), check_rx, tray_handle);
+
+    let ui = Rc::new(RefCell::new(None::<Window>));
+    let activate_ui = ui.clone();
+    let activate_app = app.clone();
+    let activate_args = args.clone();
+    let activate_flake = flake_uri.clone();
+    let activate_system = system_name.clone();
+    let activate_check_tx = check_tx.clone();
+    let start_hidden = args.tray;
+
+    app.connect_activate(move |_| {
+        if activate_ui.borrow().is_none() {
+            let window = build_window(
+                &activate_app,
+                &activate_args,
+                &activate_flake,
+                &activate_system,
+                &activate_check_tx,
+            );
+            *activate_ui.borrow_mut() = Some(window);
+        }
+        if !start_hidden {
+            if let Some(window) = activate_ui.borrow().as_ref() {
+                window.window.present();
+            }
+        }
+    });
+
+    let poll_ui = ui.clone();
+    let poll_app = app.clone();
+    let mut actions_rx = actions_rx;
+    glib::timeout_add_local(Duration::from_millis(200), move || {
+        while let Ok(action) = actions_rx.try_recv() {
+            apply_action(action, &poll_ui, &poll_app, &check_tx);
+        }
+        glib::ControlFlow::Continue
     });
 
     app.run_with_args(&[] as &[&str]);
     Ok(())
 }
 
-fn get_current_system() -> Result<String> {
-    let output = Command::new("readlink")
-        .arg("/run/booted-system")
-        .output()?;
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
-}
-
-async fn get_daemon_state() -> Result<UpdateState> {
-    let conn = zbus::Connection::session().await?;
-    let proxy = zbus::Proxy::new(
-        &conn,
-        "org.simple_nix_update_gui.Daemon",
-        "/org/simple_nix_update_gui/Daemon",
-        "org.simple_nix_update_gui.Daemon",
-    )
-    .await?;
-    let state_str: String = proxy.call("GetState", &()).await?;
-    let state: UpdateState = serde_json::from_str(&state_str)?;
-    Ok(state)
-}
-
-fn build_ui(
+fn apply_action(
+    action: UiAction,
+    ui: &Rc<RefCell<Option<Window>>>,
     app: &AdwApplication,
+    check_tx: &UnboundedSender<()>,
+) {
+    match action {
+        UiAction::State(state) => show_state(ui, &state),
+        UiAction::DaemonDown(reason) => show_daemon_down(ui, &reason),
+        UiAction::OpenWindow => {
+            let borrowed = ui.borrow();
+            if let Some(window) = borrowed.as_ref() {
+                window.window.present();
+            }
+        }
+        UiAction::CheckNow => {
+            let _ = check_tx.send(());
+        }
+        UiAction::Quit => {
+            app.quit();
+        }
+    }
+}
+
+fn show_state(ui: &Rc<RefCell<Option<Window>>>, state: &UpdateState) {
+    let borrowed = ui.borrow();
+    let Some(window) = borrowed.as_ref() else {
+        return;
+    };
+    window.banner.set_revealed(false);
+    window
+        .current_label
+        .set_text(&format!("Current: {}", state.current_system));
+    window.remote_label.set_text(&match &state.remote_system {
+        Some(remote) => format!("Remote: {}", remote),
+        None => "Remote: (none)".to_string(),
+    });
+    window.status_label.set_text(&format!(
+        "Status: {}",
+        if state.has_update {
+            "Update available"
+        } else {
+            "Up to date"
+        }
+    ));
+    window
+        .last_check_label
+        .set_text(&format!("Last check: {}", state.last_check));
+    window.update_button.set_sensitive(state.has_update);
+}
+
+fn show_daemon_down(ui: &Rc<RefCell<Option<Window>>>, reason: &str) {
+    let borrowed = ui.borrow();
+    let Some(window) = borrowed.as_ref() else {
+        return;
+    };
+    window.banner.set_revealed(true);
+    window.status_label.set_text(&format!(
+        "Status: update daemon unavailable ({reason}), using local settings"
+    ));
+    window.update_button.set_sensitive(false);
+}
+
+fn build_window(
+    app: &AdwApplication,
+    args: &Args,
     flake_uri: &str,
     system_name: &str,
-    state: &UpdateState,
-    use_nom: bool,
-) {
+    check_tx: &UnboundedSender<()>,
+) -> Window {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Simple Nix Update GUI")
@@ -119,67 +317,64 @@ fn build_ui(
         .default_height(400)
         .build();
 
-    let vbox = Box::new(Orientation::Vertical, 12);
+    let header = HeaderBar::new();
+    let banner = Banner::builder().title("Update daemon unavailable").build();
+    banner.set_button_label(Some("Retry"));
+    let banner_check_tx = check_tx.clone();
+    banner.connect_button_clicked(move |_| {
+        let _ = banner_check_tx.send(());
+    });
+
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
     vbox.set_margin_top(20);
     vbox.set_margin_bottom(20);
     vbox.set_margin_start(20);
     vbox.set_margin_end(20);
 
     let flake_label = Label::builder()
-        .label(&format!("Flake URI: {}", flake_uri))
+        .label(format!("Flake URI: {}", flake_uri))
         .xalign(0.0)
         .wrap(true)
         .build();
 
     let system_label = Label::builder()
-        .label(&format!("System: {}", system_name))
+        .label(format!("System: {}", system_name))
         .xalign(0.0)
         .build();
 
     let current_label = Label::builder()
-        .label(&format!("Current: {}", state.current_system))
+        .label("Current: unknown")
         .xalign(0.0)
         .wrap(true)
         .build();
 
-    let remote_label = if let Some(ref r) = state.remote_system {
-        Label::builder()
-            .label(&format!("Remote: {}", r))
-            .xalign(0.0)
-            .wrap(true)
-            .build()
-    } else {
-        Label::builder()
-            .label("Remote: (check failed or no data)")
-            .xalign(0.0)
-            .build()
-    };
+    let remote_label = Label::builder()
+        .label("Remote: (none)")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
 
     let status_label = Label::builder()
-        .label(&format!("Status: {}", if state.has_update { "Update available" } else { "Up to date" }))
+        .label("Status: waiting for first check")
         .xalign(0.0)
+        .wrap(true)
         .build();
 
     let last_check_label = Label::builder()
-        .label(&format!("Last check: {}", state.last_check))
+        .label("Last check: never")
         .xalign(0.0)
         .build();
 
-    let update_btn = Button::builder()
-        .label("Update...")
-        .sensitive(state.has_update)
-        .build();
-    let flake_uri_c = flake_uri.to_string();
-    let system_name_c = system_name.to_string();
-    let use_nom_c = use_nom;
-    update_btn.connect_clicked(move |_| {
-        show_update_dialog(&flake_uri_c, &system_name_c, use_nom_c);
+    let update_button = Button::builder().label("Update...").build();
+    let dialog_flake = flake_uri.to_string();
+    let dialog_system = system_name.to_string();
+    let dialog_use_nom = args.use_nom;
+    update_button.connect_clicked(move |_| {
+        show_update_dialog(&dialog_flake, &dialog_system, dialog_use_nom);
     });
 
-    let reboot_btn = Button::builder().label("Check reboot needed").build();
-    reboot_btn.connect_clicked(|_| {
-        check_and_prompt_reboot();
-    });
+    let reboot_button = Button::builder().label("Check reboot needed").build();
+    reboot_button.connect_clicked(|_| check_and_prompt_reboot());
 
     vbox.append(&flake_label);
     vbox.append(&system_label);
@@ -187,11 +382,36 @@ fn build_ui(
     vbox.append(&remote_label);
     vbox.append(&status_label);
     vbox.append(&last_check_label);
-    vbox.append(&update_btn);
-    vbox.append(&reboot_btn);
+    vbox.append(&update_button);
+    vbox.append(&reboot_button);
 
-    window.set_child(Some(&vbox));
-    window.present();
+    let view = ToolbarView::new();
+    view.add_top_bar(&header);
+    view.add_top_bar(&banner);
+    view.set_content(Some(&vbox));
+    window.set_content(Some(&view));
+
+    // Without a tray icon there would be no way back to a hidden window, so
+    // closing only gets intercepted when a tray icon exists.
+    let tray_mode = args.tray;
+    window.connect_close_request(move |window| {
+        if tray_mode {
+            window.set_visible(false);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+
+    Window {
+        window,
+        banner,
+        current_label,
+        remote_label,
+        status_label,
+        last_check_label,
+        update_button,
+    }
 }
 
 fn show_update_dialog(flake_uri: &str, system_name: &str, use_nom: bool) {
@@ -201,42 +421,39 @@ fn show_update_dialog(flake_uri: &str, system_name: &str, use_nom: bool) {
         .build();
 
     let content = dialog.content_area();
-    let vbox = Box::new(Orientation::Vertical, 12);
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
     vbox.set_margin_start(12);
     vbox.set_margin_end(12);
 
     let info = Label::builder()
-        .label(&format!("Flake: {}#{}", flake_uri, system_name))
+        .label(format!("Flake: {}#{}", flake_uri, system_name))
         .xalign(0.0)
         .wrap(true)
         .build();
 
-    let test_btn = Button::builder().label("Test build (nixos-rebuild build)").build();
-    let boot_btn = Button::builder().label("Rebuild & boot (nixos-rebuild boot)").build();
-    let switch_btn = Button::builder().label("Rebuild & switch (nixos-rebuild switch)").build();
+    let test_btn = Button::builder()
+        .label("Test build (nixos-rebuild build)")
+        .build();
+    let boot_btn = Button::builder()
+        .label("Rebuild and boot (nixos-rebuild boot)")
+        .build();
+    let switch_btn = Button::builder()
+        .label("Rebuild and switch (nixos-rebuild switch)")
+        .build();
 
-    let flake_uri_c = flake_uri.to_string();
-    let system_name_c = system_name.to_string();
-    let use_nom_c = use_nom;
-    test_btn.connect_clicked(move |_| {
-        run_nixos_rebuild("build", &flake_uri_c, &system_name_c, use_nom_c);
-    });
-
-    let flake_uri_c = flake_uri.to_string();
-    let system_name_c = system_name.to_string();
-    let use_nom_c = use_nom;
-    boot_btn.connect_clicked(move |_| {
-        run_nixos_rebuild("boot", &flake_uri_c, &system_name_c, use_nom_c);
-    });
-
-    let flake_uri_c = flake_uri.to_string();
-    let system_name_c = system_name.to_string();
-    let use_nom_c = use_nom;
-    switch_btn.connect_clicked(move |_| {
-        run_nixos_rebuild("switch", &flake_uri_c, &system_name_c, use_nom_c);
-    });
+    for (button, action) in [
+        (&test_btn, "build"),
+        (&boot_btn, "boot"),
+        (&switch_btn, "switch"),
+    ] {
+        let flake_uri = flake_uri.to_string();
+        let system_name = system_name.to_string();
+        button.connect_clicked(move |_| {
+            run_nixos_rebuild(action, &flake_uri, &system_name, use_nom);
+        });
+    }
 
     vbox.append(&info);
     vbox.append(&test_btn);
@@ -249,18 +466,21 @@ fn show_update_dialog(flake_uri: &str, system_name: &str, use_nom: bool) {
 
 fn run_nixos_rebuild(action: &str, flake_uri: &str, system_name: &str, use_nom: bool) {
     let dialog = Dialog::builder()
-        .title(&format!("nixos-rebuild {}", action))
+        .title(format!("nixos-rebuild {}", action))
         .default_width(900)
         .default_height(600)
         .build();
 
     let content = dialog.content_area();
     let terminal = Terminal::new();
-    let pty_flags = PtyFlags::DEFAULT;
     terminal.spawn_async(
-        pty_flags,
+        PtyFlags::DEFAULT,
         None,
-        &["/bin/sh", "-c", &build_command(action, flake_uri, system_name, use_nom)],
+        &[
+            "/bin/sh",
+            "-c",
+            &build_command(action, flake_uri, system_name, use_nom),
+        ],
         &[],
         gtk4::glib::SpawnFlags::DEFAULT,
         || {},
@@ -279,35 +499,39 @@ fn run_nixos_rebuild(action: &str, flake_uri: &str, system_name: &str, use_nom: 
     dialog.show();
 }
 
+/// boot and switch need root, so they run through pkexec, which raises the
+/// polkit agent popup. build only evaluates and builds, so it stays unprivileged.
 fn build_command(action: &str, flake_uri: &str, system_name: &str, use_nom: bool) -> String {
-    let rebuild = format!(
-        "nixos-rebuild {} --flake '{}#{}'",
-        action, flake_uri, system_name
-    );
+    let flake = format!("{}#{}", flake_uri, system_name);
+    let rebuild = if action == "build" {
+        format!("nixos-rebuild {} --flake '{}'", action, flake)
+    } else {
+        format!("pkexec nixos-rebuild {} --flake '{}'", action, flake)
+    };
     if use_nom {
-        // Try nom, fallback to cat if not available
-        format!("if command -v nom >/dev/null 2>&1; then {} 2>&1 | nom; else {} 2>&1; fi", rebuild, rebuild)
+        format!(
+            "if command -v nom >/dev/null 2>&1; then {} 2>&1 | nom; else {} 2>&1; fi",
+            rebuild, rebuild
+        )
     } else {
         format!("{} 2>&1", rebuild)
     }
 }
 
 fn check_and_prompt_reboot() {
-    // Check if reboot needed
-    let is_needed = is_reboot_needed_sync();
-    if !is_needed {
+    if !is_reboot_needed_sync() {
         let dialog = gtk4::MessageDialog::builder()
             .modal(true)
             .text("No reboot needed")
             .secondary_text("Booted system matches current profile.")
-        .message_type(gtk4::MessageType::Info)
-        .buttons(gtk4::ButtonsType::Ok)
-        .build();
-    dialog.connect_response(|d, _| d.close());
-    dialog.show();
+            .message_type(gtk4::MessageType::Info)
+            .buttons(gtk4::ButtonsType::Ok)
+            .build();
+        dialog.connect_response(|d, _| d.close());
+        dialog.show();
         return;
     }
-    // Show reboot dialog
+
     let dialog = gtk4::MessageDialog::builder()
         .modal(true)
         .text("Reboot needed")
@@ -315,8 +539,8 @@ fn check_and_prompt_reboot() {
         .message_type(gtk4::MessageType::Question)
         .buttons(gtk4::ButtonsType::YesNo)
         .build();
-    dialog.connect_response(move |d, resp| {
-        if resp == gtk4::ResponseType::Yes {
+    dialog.connect_response(move |d, response| {
+        if response == gtk4::ResponseType::Yes {
             let _ = Command::new("pkexec")
                 .arg("systemctl")
                 .arg("reboot")
@@ -329,13 +553,148 @@ fn check_and_prompt_reboot() {
 
 fn is_reboot_needed_sync() -> bool {
     let booted = Command::new("readlink").arg("/run/booted-system").output();
-    let profile = Command::new("readlink").arg("-f").arg("/nix/var/nix/profiles/system").output();
+    let profile = Command::new("readlink")
+        .arg("-f")
+        .arg("/nix/var/nix/profiles/system")
+        .output();
     match (booted, profile) {
-        (Ok(b), Ok(p)) if b.status.success() && p.status.success() => {
-            let bstr = String::from_utf8(b.stdout).unwrap_or_default();
-            let pstr = String::from_utf8(p.stdout).unwrap_or_default();
-            bstr.trim() != pstr.trim()
+        (Ok(booted), Ok(profile)) if booted.status.success() && profile.status.success() => {
+            let booted_path = String::from_utf8(booted.stdout).unwrap_or_default();
+            let profile_path = String::from_utf8(profile.stdout).unwrap_or_default();
+            booted_path.trim() != profile_path.trim()
         }
         _ => false,
     }
+}
+
+fn parse_interval(interval: &str) -> Duration {
+    let trimmed = interval.trim();
+    let split_at = trimmed
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, unit) = trimmed.split_at(split_at);
+    let amount: u64 = digits.parse().unwrap_or(3600);
+    match unit.trim().to_lowercase().as_str() {
+        "s" | "sec" | "second" | "seconds" => Duration::from_secs(amount),
+        "m" | "min" | "minute" | "minutes" => Duration::from_secs(amount * 60),
+        "h" | "hour" | "hours" => Duration::from_secs(amount * 3600),
+        "d" | "day" | "days" => Duration::from_secs(amount * 86400),
+        _ => Duration::from_secs(amount),
+    }
+}
+
+async fn daemon_proxy(bus_name: &str) -> Result<zbus::Proxy<'_>> {
+    let connection = zbus::Connection::system().await?;
+    zbus::Proxy::new(
+        &connection,
+        bus_name,
+        "/org/simple_nix_update_gui/Daemon",
+        "org.simple_nix_update_gui.Daemon",
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn fetch_state(proxy: &zbus::Proxy<'_>) -> Result<UpdateState> {
+    let state: String = proxy.call("GetState", &()).await?;
+    Ok(serde_json::from_str(&state)?)
+}
+
+async fn trigger_check(proxy: &zbus::Proxy<'_>) -> Result<()> {
+    let _state: String = proxy.call("CheckForUpdates", &()).await?;
+    Ok(())
+}
+
+fn spawn_poller(
+    args: Args,
+    actions: UnboundedSender<UiAction>,
+    mut check_rx: UnboundedReceiver<()>,
+    tray: Option<ksni::Handle<UpdateTray>>,
+) {
+    tokio::spawn(async move {
+        let interval = parse_interval(&args.check_interval);
+        let mut previous: Option<bool> = None;
+
+        // The daemon is started by dbus and systemd, so at GUI startup it may not
+        // own the name yet. Every failure drops back here to look for it again.
+        'connect: loop {
+            let proxy = match daemon_proxy(&args.bus_name).await {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                    wait_for_retry(&mut check_rx, interval).await;
+                    continue 'connect;
+                }
+            };
+
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                tokio::select! {
+                    // The first tick is immediate, so state is shown on startup.
+                    _ = ticker.tick() => {}
+                    _ = check_rx.recv() => {
+                        if let Err(error) = trigger_check(&proxy).await {
+                            let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                            continue 'connect;
+                        }
+                    }
+                }
+
+                let state = match fetch_state(&proxy).await {
+                    Ok(state) => state,
+                    Err(error) => {
+                        let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                        continue 'connect;
+                    }
+                };
+
+                // A first sighting counts as a transition, so a tray that starts
+                // up while an update is pending still announces it once.
+                if state.has_update && previous != Some(true) && args.auto_notify {
+                    notify_update_available(&state);
+                }
+                previous = Some(state.has_update);
+
+                if let Some(handle) = &tray {
+                    let has_update = state.has_update;
+                    handle
+                        .update(move |tray: &mut UpdateTray| {
+                            tray.has_update.store(has_update, Ordering::Relaxed);
+                        })
+                        .await;
+                }
+
+                let _ = actions.send(UiAction::State(Box::new(state)));
+            }
+        }
+    });
+}
+
+/// Sleeps until either the interval elapses or the Retry button asks for a new
+/// attempt, so a missing daemon costs one connection attempt per interval.
+async fn wait_for_retry(check_rx: &mut UnboundedReceiver<()>, interval: Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(interval) => {}
+        _ = check_rx.recv() => {}
+    }
+}
+
+fn notify_update_available(state: &UpdateState) {
+    let body = format!(
+        "Update available for {} ({})",
+        state.system_name, state.flake_uri
+    );
+    let _ = notify_rust::Notification::new()
+        .summary("System updates")
+        .body(&body)
+        .icon(ICON_NAME)
+        .timeout(notify_rust::Timeout::Milliseconds(10000))
+        .show();
+}
+
+fn get_hostname() -> String {
+    hostname::get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
 }

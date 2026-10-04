@@ -42,13 +42,14 @@ Here is a complete, working example of using this project in a NixOS configurati
     # flakeUri = "github:your-username/nixos-config";
     systemName = "my-host";
     checkInterval = "2h"; # Check every 2 hours
-    autoNotify = true;
+    autoNotify = true; # The GUI notifies, the daemon holds no session
     useNom = true;
+    trayAutostart = true; # Status icon starts with the session
+    # busName = "org.simple_nix_update_gui.Daemon"; # shared system bus name
   };
 
-  # Ensure users in wheel group can use polkit for reboot (configured by module)
-  # Also allow the daemon to notify users - notifications work in user session
-  # The daemon runs as root but uses D-Bus to send notifications to the active user
+  # The module already registers the D-Bus service and policy files and gives the
+  # daemon unit its BusName, so nothing else is needed for the bus.
 }
 ```
 
@@ -58,33 +59,36 @@ Here is a complete, working example of using this project in a NixOS configurati
 export SNU_FLAKE_URI="github:owner/nixos-configs"
 export SNU_SYSTEM_NAME="desktop"
 export SNU_CHECK_INTERVAL="30m"
+export SNU_BUS_NAME="org.simple_nix_update_gui.Daemon"
 export SNU_USE_NOM="true"
 ```
 
-### Systemd user service example (optional alternative)
+### Running the daemon without the module
 
-If you prefer running the daemon in user space, you can create a user systemd service. Note that checking system state still requires appropriate permissions; the root service as configured by the module is usually simpler.
+The daemon connects to the **system** bus and the shipped policy file only lets root
+own the bus name, so it has to run as root:
 
 ```ini
-# ~/.config/systemd/user/simple-nix-update-gui-daemon.service
+# /etc/systemd/system/simple-nix-update-gui-daemon.service
 [Unit]
-Description=Simple Nix update GUI notification daemon
-After=dbus.service
+Description=Simple Nix update GUI state daemon
 
 [Service]
-Type=simple
+Type=dbus
+BusName=org.simple_nix_update_gui.Daemon
+User=root
 Environment=SNU_FLAKE_URI=path:/etc/nixos
-Environment=SNU_SYSTEM_NAME=%H
-ExecStart=%h/.nix-profile/bin/simple-nix-update-gui-daemon
+Environment=SNU_SYSTEM_NAME=my-host
+Environment=SNU_CHECK_INTERVAL=1h
+ExecStart=/run/current-system/sw/bin/simple-nix-update-gui-daemon
 Restart=on-failure
-
-[Install]
-WantedBy=default.target
+RestartSec=60
 ```
 
 ```bash
-systemctl --user enable --now simple-nix-update-gui-daemon.service
-systemctl --user enable --now simple-nix-update-gui-daemon.timer
+sudo systemctl enable --now simple-nix-update-gui-daemon.service
 ```
 
-(Requires creating a matching timer unit as well.)
+There is no timer unit: the daemon performs its initial check at startup and then
+checks on `SNU_CHECK_INTERVAL` from its own loop. The D-Bus service and policy files
+also have to be installed, which the module does for you.

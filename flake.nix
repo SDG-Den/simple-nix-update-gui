@@ -1,5 +1,5 @@
 {
-  description = "Simple NixOS update GUI with notification daemon";
+  description = "Simple NixOS update GUI with system bus state daemon";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -52,6 +52,7 @@
           nativeBuildInputs = commonNativeBuildInputs;
           buildInputs = commonBuildInputs;
         };
+
       in {
         packages = {
           inherit daemon gui;
