@@ -31,6 +31,7 @@ struct UpdateState {
     system_name: String,
 }
 
+#[derive(Clone)]
 struct Daemon {
     state: std::sync::Arc<tokio::sync::RwLock<UpdateState>>,
     args: Args,
@@ -90,7 +91,10 @@ async fn get_hostname() -> String {
 
 async fn check_updates(args: &Args) -> Result<UpdateState> {
     let current_system = get_current_system().await?;
-    let system_name = args.system_name.clone().unwrap_or_else(|| get_hostname().await);
+    let system_name = match args.system_name.clone() {
+        Some(name) => name,
+        None => get_hostname().await,
+    };
 
     info!("Checking for updates: flake={}#{}", args.flake_uri, system_name);
 

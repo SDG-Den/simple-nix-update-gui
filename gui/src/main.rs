@@ -84,13 +84,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_hostname() -> String {
-    hostname::get()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string()
-}
-
 fn get_current_system() -> Result<String> {
     let output = Command::new("readlink")
         .arg("/run/booted-system")
@@ -269,10 +262,10 @@ fn run_nixos_rebuild(action: &str, flake_uri: &str, system_name: &str, use_nom: 
         None,
         &["/bin/sh", "-c", &build_command(action, flake_uri, system_name, use_nom)],
         &[],
-        glib::SpawnFlags::DEFAULT,
+        gtk4::glib::SpawnFlags::DEFAULT,
         || {},
         -1,
-        None::<&gio::Cancellable>,
+        None::<&gtk4::gio::Cancellable>,
         |_| {},
     );
 
