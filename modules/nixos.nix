@@ -43,16 +43,16 @@ in {
     };
 
     autoNotify = mkOption {
-      type = types.bool;
-      default = true;
+      type = types.str;
+      default = "true";
       description = ''
         Send desktop notifications when updates are available.
       '';
     };
 
     useNom = mkOption {
-      type = types.bool;
-      default = true;
+      type = types.str;
+      default = "true";
       description = ''
         Use nix-output-monitor (nom) for build output in integrated terminal if available.
       '';
