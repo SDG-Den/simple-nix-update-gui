@@ -75,14 +75,15 @@ in {
         Restart = "on-failure";
         RestartSec = "10s";
         User = "root";
-        Environment = [
-          "SNU_FLAKE_URI=${flakeUri}"
-          "SNU_SYSTEM_NAME=${systemName}"
-          "SNU_CHECK_INTERVAL=${cfg.checkInterval}"
-          "SNU_AUTO_NOTIFY=${toString cfg.autoNotify}"
-          "SNU_USE_NOM=${toString cfg.useNom}"
-          "PATH=${pkgs.nix}/bin:${pkgs.git}/bin:${pkgs.nix-output-monitor}/bin:${pkgs.openssh}/bin:${pkgs.coreutils}/bin:${pkgs.bash}/bin:$PATH"
-        ];
+        Environment =
+          [
+            "SNU_FLAKE_URI=${flakeUri}"
+            "SNU_SYSTEM_NAME=${systemName}"
+            "SNU_CHECK_INTERVAL=${cfg.checkInterval}"
+            "PATH=${pkgs.nix}/bin:${pkgs.git}/bin:${pkgs.nix-output-monitor}/bin:${pkgs.openssh}/bin:${pkgs.coreutils}/bin:${pkgs.bash}/bin:$PATH"
+          ]
+          ++ (lib.optional (cfg.autoNotify == "true") "SNU_AUTO_NOTIFY=true")
+          ++ (lib.optional (cfg.useNom == "true") "SNU_USE_NOM=true");
         ExecStart = "${daemon}/bin/simple-nix-update-gui-daemon";
       };
     };
@@ -109,5 +110,13 @@ in {
         }
       });
     '';
+
+    xdg.desktopEntries.simple-nix-update-gui = mkIf cfg.enable {
+      name = "Simple Nix Update GUI";
+      exec = "${gui}/bin/simple-nix-update-gui --flake-uri=${flakeUri} --system-name=${systemName} --use-nom=${cfg.useNom}";
+      terminal = false;
+      categories = ["System" "Utility"];
+      comment = "Simple NixOS update GUI with notification daemon";
+    };
   };
 }
