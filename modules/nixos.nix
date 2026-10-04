@@ -1,4 +1,4 @@
-{
+self: {
   config,
   lib,
   pkgs,
@@ -7,6 +7,7 @@
 with lib; let
   cfg = config.services.simple-nix-update-gui;
   flakeUri = cfg.flakeUri;
+  inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) gui daemon;
   systemName =
     if cfg.systemName == null
     then config.networking.hostName
@@ -59,9 +60,9 @@ in {
   };
 
   config = mkIf cfg.enable {
-    environment.systemPackages = with pkgs; [
-      simple-nix-update-gui
-      nix-output-monitor
+    environment.systemPackages = [
+      gui
+      pkgs.nix-output-monitor
     ];
 
     systemd.services.simple-nix-update-gui-daemon = {
@@ -82,7 +83,7 @@ in {
           "SNU_USE_NOM=${toString cfg.useNom}"
           "PATH=${pkgs.nix}/bin:${pkgs.git}/bin:${pkgs.nix-output-monitor}/bin:${pkgs.openssh}/bin:${pkgs.coreutils}/bin:${pkgs.bash}/bin:$PATH"
         ];
-        ExecStart = "${pkgs.simple-nix-update-gui-daemon}/bin/simple-nix-update-gui-daemon";
+        ExecStart = "${daemon}/bin/simple-nix-update-gui-daemon";
       };
     };
 

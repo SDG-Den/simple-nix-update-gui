@@ -89,7 +89,7 @@
       }
     )
     // {
-      nixosModules.default = import ./modules/nixos.nix;
-      nixosModules.simple-nix-update-gui = import ./modules/nixos.nix;
+      nixosModules.default = import ./modules/nixos.nix self;
+      nixosModules.simple-nix-update-gui = import ./modules/nixos.nix self;
     };
 }
