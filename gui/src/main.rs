@@ -60,6 +60,10 @@ struct UpdateState {
     has_update: bool,
     current_system: String,
     remote_system: Option<String>,
+    /// Absent when talking to a daemon that predates the field, which is why it
+    /// defaults instead of being required.
+    #[serde(default)]
+    last_error: Option<String>,
     last_check: String,
     flake_uri: String,
     system_name: String,
@@ -164,7 +168,14 @@ struct Window {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // fmt::init would read RUST_LOG and, when that is unset, install a filter
+    // that only lets ERROR through.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
     let flake_uri = args
@@ -273,13 +284,18 @@ fn show_state(ui: &Rc<RefCell<Option<Window>>>, state: &UpdateState) {
     window
         .current_label
         .set_text(&format!("Current: {}", state.current_system));
-    window.remote_label.set_text(&match &state.remote_system {
-        Some(remote) => format!("Remote: {}", remote),
-        None => "Remote: (none)".to_string(),
-    });
+    match (&state.remote_system, &state.last_error) {
+        (Some(remote), _) => window.remote_label.set_text(&format!("Remote: {}", remote)),
+        (None, Some(reason)) => window
+            .remote_label
+            .set_text(&format!("Remote: check failed: {}", reason)),
+        (None, None) => window.remote_label.set_text("Remote: (none)"),
+    }
     window.status_label.set_text(&format!(
         "Status: {}",
-        if state.has_update {
+        if state.remote_system.is_none() {
+            "Check failed"
+        } else if state.has_update {
             "Update available"
         } else {
             "Up to date"
@@ -600,9 +616,9 @@ async fn fetch_state(proxy: &zbus::Proxy<'_>) -> Result<UpdateState> {
     Ok(serde_json::from_str(&state)?)
 }
 
-async fn trigger_check(proxy: &zbus::Proxy<'_>) -> Result<()> {
-    let _state: String = proxy.call("CheckForUpdates", &()).await?;
-    Ok(())
+async fn trigger_check(proxy: &zbus::Proxy<'_>) -> Result<UpdateState> {
+    let state: String = proxy.call("CheckForUpdates", &()).await?;
+    Ok(serde_json::from_str(&state)?)
 }
 
 fn spawn_poller(
@@ -629,23 +645,32 @@ fn spawn_poller(
 
             let mut ticker = tokio::time::interval(interval);
             loop {
+                // A manual check returns the state it just computed, so it is
+                // used directly rather than asking for it a second time.
+                let mut checked = None;
                 tokio::select! {
                     // The first tick is immediate, so state is shown on startup.
                     _ = ticker.tick() => {}
                     _ = check_rx.recv() => {
-                        if let Err(error) = trigger_check(&proxy).await {
-                            let _ = actions.send(UiAction::DaemonDown(error.to_string()));
-                            continue 'connect;
+                        match trigger_check(&proxy).await {
+                            Ok(state) => checked = Some(state),
+                            Err(error) => {
+                                let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                                continue 'connect;
+                            }
                         }
                     }
                 }
 
-                let state = match fetch_state(&proxy).await {
-                    Ok(state) => state,
-                    Err(error) => {
-                        let _ = actions.send(UiAction::DaemonDown(error.to_string()));
-                        continue 'connect;
-                    }
+                let state = match checked {
+                    Some(state) => state,
+                    None => match fetch_state(&proxy).await {
+                        Ok(state) => state,
+                        Err(error) => {
+                            let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                            continue 'connect;
+                        }
+                    },
                 };
 
                 // A first sighting counts as a transition, so a tray that starts

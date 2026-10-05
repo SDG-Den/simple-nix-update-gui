@@ -2,9 +2,15 @@ use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use tokio::time::Duration;
+use std::time::Duration as StdDuration;
+use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 use zbus::{dbus_interface, ConnectionBuilder};
+
+/// A cold eval of a large flake fetches inputs and walks the whole module tree,
+/// so this is generous, but it is still a ceiling rather than no ceiling.
+const EVAL_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "simple-nix-update-gui-daemon")]
@@ -29,6 +35,10 @@ struct UpdateState {
     has_update: bool,
     current_system: String,
     remote_system: Option<String>,
+    /// Why the last check produced no remote system, kept so the GUI can say
+    /// what went wrong instead of showing an unexplained placeholder.
+    #[serde(default)]
+    last_error: Option<String>,
     last_check: String,
     flake_uri: String,
     system_name: String,
@@ -51,7 +61,13 @@ impl Daemon {
             }
             Err(e) => {
                 error!("Update check failed: {}", e);
-                format!("{{\"error\": \"{}\"}}", e)
+                let mut failed = self.state.read().await.clone();
+                failed.has_update = false;
+                failed.remote_system = None;
+                failed.last_error = Some(e.to_string());
+                failed.last_check = chrono::Local::now().to_rfc3339();
+                *self.state.write().await = failed.clone();
+                serde_json::to_string(&failed).unwrap_or_else(|_| "{}".to_string())
             }
         }
     }
@@ -107,42 +123,64 @@ async fn check_updates(args: &Args) -> Result<UpdateState> {
         system_name
     );
 
-    let output = Command::new("nix")
-        .arg("eval")
-        .arg("--no-write-lock-file")
-        .arg("--raw")
-        .arg(eval_cmd)
-        .output();
-
-    let (has_update, remote_system) = match output {
-        Ok(out) if out.status.success() => {
-            let remote = String::from_utf8(out.stdout)?.trim().to_string();
-            let has_update = remote != current_system;
-            info!(
-                "Update check result: has_update={}, current={}, remote={}",
-                has_update, current_system, remote
-            );
-            (has_update, Some(remote))
-        }
-        Ok(out) => {
-            let stderr = String::from_utf8(out.stderr)?;
-            warn!("nix eval failed: {}", stderr);
-            (false, None)
-        }
-        Err(e) => {
-            warn!("Failed to run nix eval: {}", e);
-            (false, None)
-        }
-    };
+    let (has_update, remote_system, last_error) =
+        match timeout(EVAL_TIMEOUT, eval_remote_system(eval_cmd)).await {
+            Ok(Ok(remote)) => {
+                let has_update = remote != current_system;
+                info!(
+                    "Update check result: has_update={}, current={}, remote={}",
+                    has_update, current_system, remote
+                );
+                (has_update, Some(remote), None)
+            }
+            Ok(Err(message)) => {
+                warn!("nix eval failed: {}", message);
+                (false, None, Some(message))
+            }
+            Err(_) => {
+                let message = format!("nix eval did not finish within {:?}", EVAL_TIMEOUT);
+                warn!("{}", message);
+                (false, None, Some(message))
+            }
+        };
 
     Ok(UpdateState {
         has_update,
         current_system,
         remote_system,
+        last_error,
         last_check: chrono::Local::now().to_rfc3339(),
         flake_uri: args.flake_uri.clone(),
         system_name,
     })
+}
+
+/// Runs the eval the check hinges on and returns the remote system store path,
+/// or the reason it could not be had. Lossy decoding keeps a stray non UTF-8
+/// byte in nix's output from hiding the message that matters.
+async fn eval_remote_system(eval_cmd: String) -> Result<String, String> {
+    let spawned = tokio::task::spawn_blocking(move || {
+        Command::new("nix")
+            .arg("eval")
+            .arg("--no-write-lock-file")
+            .arg("--raw")
+            .arg(eval_cmd)
+            .output()
+    })
+    .await
+    .map_err(|e| format!("nix eval task failed: {e}"))?;
+
+    let output = spawned.map_err(|e| format!("could not run nix eval: {e}"))?;
+
+    if output.status.success() {
+        Ok(text(&output.stdout))
+    } else {
+        Err(text(&output.stderr))
+    }
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
 }
 
 async fn is_reboot_needed() -> Result<bool> {
@@ -163,7 +201,13 @@ async fn is_reboot_needed() -> Result<bool> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // fmt::init would read RUST_LOG and, when that is unset, install a filter
+    // that only lets ERROR through, which silences every reason a check failed.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
 
@@ -174,6 +218,7 @@ async fn main() -> Result<()> {
             has_update: false,
             current_system: "unknown".to_string(),
             remote_system: None,
+            last_error: None,
             last_check: chrono::Local::now().to_rfc3339(),
             flake_uri: args.flake_uri.clone(),
             system_name: args
