@@ -139,16 +139,25 @@ in
     # per-user data dir, and systemd.user.services already starts the daemon at
     # login, so activation would be redundant.
 
-    environment.etc = optionalAttrs cfg.trayAutostart {
-      "xdg/autostart/simple-nix-update-gui-tray.desktop".source = pkgs.makeDesktopItem {
-        name = "simple-nix-update-gui-tray";
-        exec = "${gui}/bin/simple-nix-update-gui ${cliFlags} --tray";
-        desktopName = "Simple Nix Update GUI";
-        icon = "system-software-update";
-        comment = "Tray icon for the Simple NixOS update GUI";
-        terminal = false;
+    # A system-wide settings file so a binary launched from a terminal, a
+    # launcher, or nix run picks up the same settings as the tray and the
+    # daemon. Both binaries resolve flag, then env, then this file, then
+    # hardcoded defaults. The daemon unit still passes the values as env too;
+    # the file is the fallback for every other way of starting the GUI.
+    environment.etc =
+      {
+        "simple-nix-update-gui/settings.env".text = lib.concatStringsSep "\n" (settingsEnv ++ [""]);
+      }
+      // optionalAttrs cfg.trayAutostart {
+        "xdg/autostart/simple-nix-update-gui-tray.desktop".source = pkgs.makeDesktopItem {
+          name = "simple-nix-update-gui-tray";
+          exec = "${gui}/bin/simple-nix-update-gui ${cliFlags} --tray";
+          desktopName = "Simple Nix Update GUI";
+          icon = "system-software-update";
+          comment = "Tray icon for the Simple NixOS update GUI";
+          terminal = false;
+        };
       };
-    };
 
     # A user unit, not a system one, so it runs as whoever logged in. That is
     # what lets the eval reach a private flake: nix shells out to git, which

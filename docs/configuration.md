@@ -1,19 +1,35 @@
 ## Configuration
 
-The application is configured via CLI arguments and environment variables. Configuration is shared between daemon and GUI.
+The application is configured via CLI arguments, environment variables, a
+system-wide settings file, or builtin defaults, in that order of precedence.
+The NixOS module writes the settings file to
+`/etc/simple-nix-update-gui/settings.env`, so any way of starting the GUI
+(terminal, desktop entry, tray autostart) uses the same values. Every binary
+logs each setting with its source on startup.
+
+### Configuration sources
+
+| Source | Meaning |
+|--------|---------|
+| CLI flag | `--flake-uri="..."`, `--use-nom=false`, etc. |
+| Environment | `SNU_FLAKE_URI`, `SNU_SYSTEM_NAME`, `SNU_CHECK_INTERVAL`, `SNU_BUS_NAME`, `SNU_USE_NOM`, `SNU_AUTO_NOTIFY` |
+| Settings file | `/etc/simple-nix-update-gui/settings.env` (written by the module as `KEY=value` lines) |
+| Builtin default | The hardcoded fallback value |
 
 ### Daemon options
 
 | CLI flag | Env var | Default | Description |
 |---------|---------|---------|-------------|
-| `--flake-uri` | `SNU_FLAKE_URI` | (required) | Flake URI to check. Any valid nix flake URI (e.g., `path:/etc/nixos`, `github:owner/repo`, `git+https://...`) |
+| `--flake-uri` | `SNU_FLAKE_URI` | (none; required) | Flake URI to check. Any valid nix flake URI (e.g., `path:/etc/nixos`, `github:owner/repo`, `git+https://...`) |
 | `--system-name` | `SNU_SYSTEM_NAME` | hostname | NixOS configuration name to check (e.g., `nixosConfigurations.<name>`) |
 | `--check-interval` | `SNU_CHECK_INTERVAL` | `1h` | Check interval. Supports units: `s`, `m`, `min`, `h`, `d`, `hour`, etc. |
-| `--bus-name` | `SNU_BUS_NAME` | `org.simple_nix_update_gui.Daemon` | Well known name the daemon owns on the system bus |
+| `--bus-name` | `SNU_BUS_NAME` | `org.simple_nix_update_gui.Daemon` | Well known name the daemon owns on the **session** bus |
 
-The daemon owns its bus name on the **system** bus and runs as root. There is no
-`--auto-notify` option: the daemon holds no session, so it cannot raise notifications.
-It runs the initial check immediately at startup and then keeps checking on
+The daemon runs as the logged-in user in a `systemd.user` unit and owns its bus
+name on the session bus. It needs the user's `HOME` only for git credentials
+when the flake is a private git repository. There is no `--auto-notify` option:
+the daemon holds no session, so it cannot raise notifications. It runs the
+initial check immediately at startup and then keeps checking on
 `--check-interval`, and systemd restarts it on failure.
 
 ### GUI options
@@ -25,11 +41,11 @@ It runs the initial check immediately at startup and then keeps checking on
 | `--use-nom` | `SNU_USE_NOM` | `true` | Pipe nixos-rebuild output through `nix-output-monitor` (nom) if available |
 | `--auto-notify` | `SNU_AUTO_NOTIFY` | `true` | Send a desktop notification the first time an update is seen, and on every later `no update -> update` transition |
 | `--check-interval` | `SNU_CHECK_INTERVAL` | `1h` | How often the GUI asks the daemon for state |
-| `--bus-name` | `SNU_BUS_NAME` | `org.simple_nix_update_gui.Daemon` | Well known name to look for on the system bus |
+| `--bus-name` | `SNU_BUS_NAME` | `org.simple_nix_update_gui.Daemon` | Well known name to look for on the session bus |
 | `--tray` | (none) | off | Start hidden with a status icon instead of showing the window |
 
 Booleans are always written out explicitly by the NixOS module, including when
-false, because both binaries fall back to `true` when the variable is absent. Use
+false, because both binaries fall back to `true` when a value is absent. Use
 `--use-nom=false` or `SNU_USE_NOM=false` when running by hand.
 
 ### NixOS module options
@@ -39,14 +55,16 @@ false, because both binaries fall back to `true` when the variable is absent. Us
 | `services.simple-nix-update-gui.enable` | bool | `false` | Enable the service |
 | `services.simple-nix-update-gui.flakeUri` | str | - | Flake URI to monitor |
 | `services.simple-nix-update-gui.systemName` | nullOr str | `null` | System name (defaults to `config.networking.hostName`) |
-| `services.simple-nix-update-gui.busName` | str | `"org.simple_nix_update_gui.Daemon"` | System bus name used by the daemon and the GUI |
+| `services.simple-nix-update-gui.busName` | str | `"org.simple_nix_update_gui.Daemon"` | Session bus name used by the daemon and the GUI |
 | `services.simple-nix-update-gui.checkInterval` | str | `"1h"` | Check interval, used by the daemon's own loop and by the GUI's poll interval |
 | `services.simple-nix-update-gui.autoNotify` | bool | `true` | Let the GUI notify when an update becomes available |
 | `services.simple-nix-update-gui.useNom` | bool | `true` | Use nom in integrated terminal |
 | `services.simple-nix-update-gui.trayAutostart` | bool | `true` | Add the `xdg/autostart` entry that starts the GUI with `--tray` |
 
-The module also registers the D-Bus service and policy files, so no manual
-`dbus` configuration is needed.
+The module starts the daemon through a `systemd.user` unit, adds the tray
+autostart and launcher desktop entries, writes
+`/etc/simple-nix-update-gui/settings.env`, and adds a polkit rule that lets the
+`wheel` group reboot and power off without a password prompt.
 
 ## Behavior
 

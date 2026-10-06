@@ -8,6 +8,7 @@ use libadwaita::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,8 @@ use vte4::prelude::*;
 use vte4::{PtyFlags, Terminal};
 
 const ICON_NAME: &str = "system-software-update";
+
+const SETTINGS_FILE: &str = "/etc/simple-nix-update-gui/settings.env";
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "simple-nix-update-gui")]
@@ -31,28 +34,181 @@ struct Args {
         long,
         env = "SNU_USE_NOM",
         action = ArgAction::Set,
-        value_parser = clap::value_parser!(bool),
-        default_value_t = true
+        value_parser = clap::value_parser!(bool)
     )]
-    use_nom: bool,
-    #[arg(long, env = "SNU_CHECK_INTERVAL", default_value = "1h")]
-    check_interval: String,
+    use_nom: Option<bool>,
+    #[arg(long, env = "SNU_CHECK_INTERVAL")]
+    check_interval: Option<String>,
     #[arg(
         long,
         env = "SNU_AUTO_NOTIFY",
         action = ArgAction::Set,
-        value_parser = clap::value_parser!(bool),
-        default_value_t = true
+        value_parser = clap::value_parser!(bool)
     )]
-    auto_notify: bool,
-    #[arg(
-        long,
-        env = "SNU_BUS_NAME",
-        default_value = "org.simple_nix_update_gui.Daemon"
-    )]
-    bus_name: String,
+    auto_notify: Option<bool>,
+    #[arg(long, env = "SNU_BUS_NAME")]
+    bus_name: Option<String>,
     #[arg(long)]
     tray: bool,
+}
+
+/// The values the rest of the program runs on, resolved from flag, then
+/// environment, then the settings file the NixOS module writes, then builtin
+/// defaults. Logging the source of every value makes a misconfiguration show
+/// up in the first lines of output instead of as a wrong label in the UI.
+#[derive(Debug, Clone)]
+struct Settings {
+    flake_uri: String,
+    system_name: String,
+    check_interval: String,
+    bus_name: String,
+    use_nom: bool,
+    auto_notify: bool,
+    tray: bool,
+}
+
+fn build_settings(args: &Args) -> Settings {
+    let file = load_settings_file();
+
+    let (flake_uri, flake_uri_source) =
+        resolve_str(&args.flake_uri, "SNU_FLAKE_URI", &file, "path:/etc/nixos");
+    tracing::info!(setting = "flake_uri", value = %flake_uri, source = flake_uri_source);
+
+    let (system_name, system_name_source) =
+        resolve_str(&args.system_name, "SNU_SYSTEM_NAME", &file, "");
+    let (system_name, system_name_source) = if system_name.is_empty() {
+        (get_hostname(), "builtin default")
+    } else {
+        (system_name, system_name_source)
+    };
+    tracing::info!(setting = "system_name", value = %system_name, source = system_name_source);
+
+    let (check_interval, check_interval_source) =
+        resolve_str(&args.check_interval, "SNU_CHECK_INTERVAL", &file, "1h");
+    tracing::info!(setting = "check_interval", value = %check_interval, source = check_interval_source);
+
+    let (bus_name, bus_name_source) = resolve_str(
+        &args.bus_name,
+        "SNU_BUS_NAME",
+        &file,
+        "org.simple_nix_update_gui.Daemon",
+    );
+    tracing::info!(setting = "bus_name", value = %bus_name, source = bus_name_source);
+
+    let (use_nom, use_nom_source) = resolve_bool(&args.use_nom, "SNU_USE_NOM", &file, true);
+    tracing::info!(
+        setting = "use_nom",
+        value = use_nom,
+        source = use_nom_source
+    );
+
+    let (auto_notify, auto_notify_source) =
+        resolve_bool(&args.auto_notify, "SNU_AUTO_NOTIFY", &file, true);
+    tracing::info!(
+        setting = "auto_notify",
+        value = auto_notify,
+        source = auto_notify_source
+    );
+
+    let tray = args.tray;
+    tracing::info!(
+        setting = "tray",
+        value = tray,
+        source = if tray { "flag" } else { "builtin default" }
+    );
+
+    Settings {
+        flake_uri,
+        system_name,
+        check_interval,
+        bus_name,
+        use_nom,
+        auto_notify,
+        tray,
+    }
+}
+
+fn resolve_str(
+    flag_env: &Option<String>,
+    env_key: &str,
+    file: &HashMap<String, String>,
+    default: &str,
+) -> (String, &'static str) {
+    if let Some(value) = flag_env {
+        let source = if std::env::var(env_key).is_ok() {
+            "env"
+        } else {
+            "flag"
+        };
+        (value.clone(), source)
+    } else if let Some(value) = file.get(env_key) {
+        (value.clone(), "settings file")
+    } else {
+        (default.to_string(), "builtin default")
+    }
+}
+
+fn resolve_bool(
+    flag_env: &Option<bool>,
+    env_key: &str,
+    file: &HashMap<String, String>,
+    default: bool,
+) -> (bool, &'static str) {
+    if let Some(value) = flag_env {
+        let source = if std::env::var(env_key).is_ok() {
+            "env"
+        } else {
+            "flag"
+        };
+        (*value, source)
+    } else if let Some(raw) = file.get(env_key) {
+        match parse_bool(raw) {
+            Some(value) => (value, "settings file"),
+            None => {
+                tracing::warn!(env_key, value = %raw, "invalid bool in settings file, using default");
+                (default, "builtin default")
+            }
+        }
+    } else {
+        (default, "builtin default")
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn load_settings_file() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    match std::fs::read_to_string(SETTINGS_FILE) {
+        Ok(content) => {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    map.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+            tracing::info!(
+                path = SETTINGS_FILE,
+                entries = map.len(),
+                "loaded settings file"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path = SETTINGS_FILE, "settings file not present");
+        }
+        Err(error) => {
+            tracing::warn!(path = SETTINGS_FILE, error = %error, "could not read settings file");
+        }
+    }
+    map
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,12 +333,19 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // notify-rust and other native helpers can panic from deep inside their own
+    // runtime. A panic hook keeps the reason in the logs instead of a UI stuck
+    // on its initial labels.
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic: {info}");
+        tracing::error!(
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "panic backtrace"
+        );
+    }));
+
     let args = Args::parse();
-    let flake_uri = args
-        .flake_uri
-        .clone()
-        .unwrap_or_else(|| "path:/etc/nixos".to_string());
-    let system_name = args.system_name.clone().unwrap_or_else(get_hostname);
+    let settings = build_settings(&args);
 
     let (actions_tx, actions_rx) = unbounded_channel::<UiAction>();
     let (check_tx, check_rx) = unbounded_channel::<()>();
@@ -190,9 +353,13 @@ async fn main() -> Result<()> {
     let app = AdwApplication::new(Some("org.simple_nix_update_gui"), Default::default());
     // In tray mode the process has to outlive its window, and the guard has to
     // stay alive for as long as it does.
-    let _hold_guard = if args.tray { Some(app.hold()) } else { None };
+    let _hold_guard = if settings.tray {
+        Some(app.hold())
+    } else {
+        None
+    };
 
-    let tray_handle = if args.tray {
+    let tray_handle = if settings.tray {
         let tray = UpdateTray {
             has_update: Arc::new(AtomicBool::new(false)),
             actions: actions_tx.clone(),
@@ -208,26 +375,18 @@ async fn main() -> Result<()> {
         None
     };
 
-    spawn_poller(args.clone(), actions_tx.clone(), check_rx, tray_handle);
+    spawn_poller(settings.clone(), actions_tx.clone(), check_rx, tray_handle);
 
     let ui = Rc::new(RefCell::new(None::<Window>));
     let activate_ui = ui.clone();
     let activate_app = app.clone();
-    let activate_args = args.clone();
-    let activate_flake = flake_uri.clone();
-    let activate_system = system_name.clone();
+    let activate_settings = settings.clone();
     let activate_check_tx = check_tx.clone();
-    let start_hidden = args.tray;
+    let start_hidden = settings.tray;
 
     app.connect_activate(move |_| {
         if activate_ui.borrow().is_none() {
-            let window = build_window(
-                &activate_app,
-                &activate_args,
-                &activate_flake,
-                &activate_system,
-                &activate_check_tx,
-            );
+            let window = build_window(&activate_app, &activate_settings, &activate_check_tx);
             *activate_ui.borrow_mut() = Some(window);
         }
         if !start_hidden {
@@ -321,9 +480,7 @@ fn show_daemon_down(ui: &Rc<RefCell<Option<Window>>>, reason: &str) {
 
 fn build_window(
     app: &AdwApplication,
-    args: &Args,
-    flake_uri: &str,
-    system_name: &str,
+    settings: &Settings,
     check_tx: &UnboundedSender<()>,
 ) -> Window {
     let window = ApplicationWindow::builder()
@@ -348,13 +505,13 @@ fn build_window(
     vbox.set_margin_end(20);
 
     let flake_label = Label::builder()
-        .label(format!("Flake URI: {}", flake_uri))
+        .label(format!("Flake URI: {}", settings.flake_uri))
         .xalign(0.0)
         .wrap(true)
         .build();
 
     let system_label = Label::builder()
-        .label(format!("System: {}", system_name))
+        .label(format!("System: {}", settings.system_name))
         .xalign(0.0)
         .build();
 
@@ -382,9 +539,9 @@ fn build_window(
         .build();
 
     let update_button = Button::builder().label("Update...").build();
-    let dialog_flake = flake_uri.to_string();
-    let dialog_system = system_name.to_string();
-    let dialog_use_nom = args.use_nom;
+    let dialog_flake = settings.flake_uri.clone();
+    let dialog_system = settings.system_name.clone();
+    let dialog_use_nom = settings.use_nom;
     update_button.connect_clicked(move |_| {
         show_update_dialog(&dialog_flake, &dialog_system, dialog_use_nom);
     });
@@ -409,7 +566,7 @@ fn build_window(
 
     // Without a tray icon there would be no way back to a hidden window, so
     // closing only gets intercepted when a tray icon exists.
-    let tray_mode = args.tray;
+    let tray_mode = settings.tray;
     window.connect_close_request(move |window| {
         if tray_mode {
             window.set_visible(false);
@@ -622,21 +779,34 @@ async fn trigger_check(proxy: &zbus::Proxy<'_>) -> Result<UpdateState> {
 }
 
 fn spawn_poller(
-    args: Args,
+    settings: Settings,
     actions: UnboundedSender<UiAction>,
     mut check_rx: UnboundedReceiver<()>,
     tray: Option<ksni::Handle<UpdateTray>>,
 ) {
     tokio::spawn(async move {
-        let interval = parse_interval(&args.check_interval);
+        let interval = parse_interval(&settings.check_interval);
         let mut previous: Option<bool> = None;
+        tracing::info!(
+            bus_name = %settings.bus_name,
+            interval = ?interval,
+            "poller started"
+        );
 
         // The daemon is started by dbus and systemd, so at GUI startup it may not
         // own the name yet. Every failure drops back here to look for it again.
         'connect: loop {
-            let proxy = match daemon_proxy(&args.bus_name).await {
-                Ok(proxy) => proxy,
+            let proxy = match daemon_proxy(&settings.bus_name).await {
+                Ok(proxy) => {
+                    tracing::info!(bus_name = %settings.bus_name, "connected to daemon");
+                    proxy
+                }
                 Err(error) => {
+                    tracing::warn!(
+                        bus_name = %settings.bus_name,
+                        error = %error,
+                        "daemon not reachable, waiting before retry"
+                    );
                     let _ = actions.send(UiAction::DaemonDown(error.to_string()));
                     wait_for_retry(&mut check_rx, interval).await;
                     continue 'connect;
@@ -652,9 +822,11 @@ fn spawn_poller(
                     // The first tick is immediate, so state is shown on startup.
                     _ = ticker.tick() => {}
                     _ = check_rx.recv() => {
+                        tracing::info!("manual check requested");
                         match trigger_check(&proxy).await {
                             Ok(state) => checked = Some(state),
                             Err(error) => {
+                                tracing::error!(error = %error, "manual check failed");
                                 let _ = actions.send(UiAction::DaemonDown(error.to_string()));
                                 continue 'connect;
                             }
@@ -664,19 +836,45 @@ fn spawn_poller(
 
                 let state = match checked {
                     Some(state) => state,
-                    None => match fetch_state(&proxy).await {
-                        Ok(state) => state,
-                        Err(error) => {
-                            let _ = actions.send(UiAction::DaemonDown(error.to_string()));
-                            continue 'connect;
+                    None => {
+                        tracing::info!("querying daemon for state");
+                        match fetch_state(&proxy).await {
+                            Ok(state) => state,
+                            Err(error) => {
+                                tracing::error!(error = %error, "fetch_state failed");
+                                let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                                continue 'connect;
+                            }
                         }
-                    },
+                    }
                 };
+                tracing::debug!(
+                    has_update = state.has_update,
+                    current = %state.current_system,
+                    remote = ?state.remote_system,
+                    error = ?state.last_error,
+                    last_check = %state.last_check,
+                    daemon_flake_uri = %state.flake_uri,
+                    daemon_system = %state.system_name,
+                    "state fetched from daemon"
+                );
+                if state.flake_uri != settings.flake_uri {
+                    tracing::warn!(
+                        gui = %settings.flake_uri,
+                        daemon = %state.flake_uri,
+                        "GUI and daemon disagree on flake URI"
+                    );
+                }
 
                 // A first sighting counts as a transition, so a tray that starts
                 // up while an update is pending still announces it once.
-                if state.has_update && previous != Some(true) && args.auto_notify {
-                    notify_update_available(&state);
+                if state.has_update && previous != Some(true) && settings.auto_notify {
+                    tracing::info!(
+                        system = %state.system_name,
+                        flake_uri = %state.flake_uri,
+                        "update available, sending notification"
+                    );
+                    notify_update_available(&state).await;
                 }
                 previous = Some(state.has_update);
 
@@ -704,17 +902,28 @@ async fn wait_for_retry(check_rx: &mut UnboundedReceiver<()>, interval: Duration
     }
 }
 
-fn notify_update_available(state: &UpdateState) {
+/// notify-rust spins up its own tokio runtime on the calling thread, which
+/// panics with "Cannot start a runtime from within a runtime" when called on a
+/// tokio worker. spawn_blocking runs it on a blocking thread instead.
+async fn notify_update_available(state: &UpdateState) {
     let body = format!(
         "Update available for {} ({})",
         state.system_name, state.flake_uri
     );
-    let _ = notify_rust::Notification::new()
-        .summary("System updates")
-        .body(&body)
-        .icon(ICON_NAME)
-        .timeout(notify_rust::Timeout::Milliseconds(10000))
-        .show();
+    match tokio::task::spawn_blocking(move || {
+        notify_rust::Notification::new()
+            .summary("System updates")
+            .body(&body)
+            .icon(ICON_NAME)
+            .timeout(notify_rust::Timeout::Milliseconds(10000))
+            .show()
+    })
+    .await
+    {
+        Ok(Ok(_)) => tracing::info!("notification sent"),
+        Ok(Err(error)) => tracing::warn!(error = %error, "notification failed"),
+        Err(error) => tracing::warn!(error = %error, "notification task panicked"),
+    }
 }
 
 fn get_hostname() -> String {

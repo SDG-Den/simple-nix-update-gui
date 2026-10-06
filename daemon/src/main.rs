@@ -1,11 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration as StdDuration;
 use tokio::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zbus::{dbus_interface, ConnectionBuilder};
 
@@ -13,22 +14,119 @@ use zbus::{dbus_interface, ConnectionBuilder};
 /// so this is generous, but it is still a ceiling rather than no ceiling.
 const EVAL_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 
+const SETTINGS_FILE: &str = "/etc/simple-nix-update-gui/settings.env";
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "simple-nix-update-gui-daemon")]
 #[command(about = "Notification daemon for simple-nix-update-gui")]
 struct Args {
     #[arg(long, env = "SNU_FLAKE_URI")]
-    flake_uri: String,
+    flake_uri: Option<String>,
     #[arg(long, env = "SNU_SYSTEM_NAME")]
     system_name: Option<String>,
-    #[arg(long, env = "SNU_CHECK_INTERVAL", default_value = "1h")]
+    #[arg(long, env = "SNU_CHECK_INTERVAL")]
+    check_interval: Option<String>,
+    #[arg(long, env = "SNU_BUS_NAME")]
+    bus_name: Option<String>,
+}
+
+/// Same resolution order as the GUI: flag, then env, then the settings file the
+/// NixOS module writes, then builtin defaults. Every value logs its source.
+#[derive(Debug, Clone)]
+struct Settings {
+    flake_uri: String,
+    system_name: Option<String>,
     check_interval: String,
-    #[arg(
-        long,
-        env = "SNU_BUS_NAME",
-        default_value = "org.simple_nix_update_gui.Daemon"
-    )]
     bus_name: String,
+}
+
+fn build_settings(args: &Args) -> anyhow::Result<Settings> {
+    let file = load_settings_file();
+
+    let (flake_uri, flake_uri_source) = resolve_str(&args.flake_uri, "SNU_FLAKE_URI", &file, "");
+    if flake_uri.is_empty() {
+        anyhow::bail!(
+            "missing flake URI: pass --flake-uri, set SNU_FLAKE_URI, or create {SETTINGS_FILE}"
+        );
+    }
+    info!(setting = "flake_uri", value = %flake_uri, source = flake_uri_source);
+
+    let (system_name, system_name_source) =
+        resolve_str(&args.system_name, "SNU_SYSTEM_NAME", &file, "");
+    let system_name = if system_name.is_empty() {
+        None
+    } else {
+        Some(system_name)
+    };
+    info!(setting = "system_name", value = ?system_name, source = system_name_source);
+
+    let (check_interval, check_interval_source) =
+        resolve_str(&args.check_interval, "SNU_CHECK_INTERVAL", &file, "1h");
+    info!(setting = "check_interval", value = %check_interval, source = check_interval_source);
+
+    let (bus_name, bus_name_source) = resolve_str(
+        &args.bus_name,
+        "SNU_BUS_NAME",
+        &file,
+        "org.simple_nix_update_gui.Daemon",
+    );
+    info!(setting = "bus_name", value = %bus_name, source = bus_name_source);
+
+    Ok(Settings {
+        flake_uri,
+        system_name,
+        check_interval,
+        bus_name,
+    })
+}
+
+fn resolve_str(
+    flag_env: &Option<String>,
+    env_key: &str,
+    file: &HashMap<String, String>,
+    default: &str,
+) -> (String, &'static str) {
+    if let Some(value) = flag_env {
+        let source = if std::env::var(env_key).is_ok() {
+            "env"
+        } else {
+            "flag"
+        };
+        (value.clone(), source)
+    } else if let Some(value) = file.get(env_key) {
+        (value.clone(), "settings file")
+    } else {
+        (default.to_string(), "builtin default")
+    }
+}
+
+fn load_settings_file() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    match std::fs::read_to_string(SETTINGS_FILE) {
+        Ok(content) => {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    map.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+            info!(
+                path = SETTINGS_FILE,
+                entries = map.len(),
+                "loaded settings file"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            info!(path = SETTINGS_FILE, "settings file not present");
+        }
+        Err(error) => {
+            warn!(path = SETTINGS_FILE, error = %error, "could not read settings file");
+        }
+    }
+    map
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,14 +146,14 @@ struct UpdateState {
 #[derive(Clone)]
 struct Daemon {
     state: std::sync::Arc<tokio::sync::RwLock<UpdateState>>,
-    args: Args,
+    settings: Settings,
 }
 
 #[dbus_interface(name = "org.simple_nix_update_gui.Daemon")]
 impl Daemon {
     async fn check_for_updates(&self) -> String {
         info!("Manual update check triggered");
-        match check_updates(&self.args).await {
+        match check_updates(&self.settings).await {
             Ok(new_state) => {
                 *self.state.write().await = new_state.clone();
                 serde_json::to_string(&new_state).unwrap_or_else(|_| "{}".to_string())
@@ -74,6 +172,7 @@ impl Daemon {
     }
 
     async fn get_state(&self) -> String {
+        debug!("GetState request served");
         let state = self.state.read().await.clone();
         serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
     }
@@ -106,23 +205,23 @@ async fn get_hostname() -> String {
         .to_string()
 }
 
-async fn check_updates(args: &Args) -> Result<UpdateState> {
+async fn check_updates(settings: &Settings) -> Result<UpdateState> {
     let current_system = get_current_system().await?;
-    let system_name = match args.system_name.clone() {
+    let system_name = match settings.system_name.clone() {
         Some(name) => name,
         None => get_hostname().await,
     };
 
     info!(
         "Checking for updates: flake={}#{}",
-        args.flake_uri, system_name
+        settings.flake_uri, system_name
     );
 
     // lib.nixosSystem has no `system` attribute. The built system path lives at
     // config.system.build.toplevel, which is what /run/booted-system points at.
     let eval_cmd = format!(
         "{}#nixosConfigurations.{}.config.system.build.toplevel",
-        args.flake_uri.trim_end_matches('/'),
+        settings.flake_uri.trim_end_matches('/'),
         system_name
     );
 
@@ -147,7 +246,7 @@ async fn check_updates(args: &Args) -> Result<UpdateState> {
         remote_system,
         last_error,
         last_check: chrono::Local::now().to_rfc3339(),
-        flake_uri: args.flake_uri.clone(),
+        flake_uri: settings.flake_uri.clone(),
         system_name,
     })
 }
@@ -219,7 +318,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    std::panic::set_hook(Box::new(|info| {
+        error!("panic: {info}");
+        error!(
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "panic backtrace"
+        );
+    }));
+
     let args = Args::parse();
+    let settings = build_settings(&args)?;
 
     // The name is taken before the first nix eval. Under Type=dbus systemd waits
     // for the name, and a cold eval of a large flake can outlast that wait.
@@ -230,24 +338,25 @@ async fn main() -> Result<()> {
             remote_system: None,
             last_error: None,
             last_check: chrono::Local::now().to_rfc3339(),
-            flake_uri: args.flake_uri.clone(),
-            system_name: args
+            flake_uri: settings.flake_uri.clone(),
+            system_name: settings
                 .system_name
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string()),
         })),
-        args: args.clone(),
+        settings: settings.clone(),
     };
 
     // Session bus, not system bus. The daemon runs as the logged in user in a
     // systemd user unit, and needs their HOME so git can find their credentials.
     let _conn = ConnectionBuilder::session()?
-        .name(args.bus_name.clone())?
+        .name(settings.bus_name.clone())?
         .serve_at("/org/simple_nix_update_gui/Daemon", daemon.clone())?
         .build()
         .await?;
+    info!(bus_name = %settings.bus_name, "daemon owns bus name");
 
-    let initial_state = match check_updates(&args).await {
+    let initial_state = match check_updates(&settings).await {
         Ok(state) => state,
         Err(e) => {
             error!("Initial check failed: {}", e);
@@ -257,13 +366,14 @@ async fn main() -> Result<()> {
     *daemon.state.write().await = initial_state;
 
     // Periodic checks
-    let duration = parse_duration(&args.check_interval).unwrap_or(Duration::from_secs(3600));
+    let duration = parse_duration(&settings.check_interval).unwrap_or(Duration::from_secs(3600));
     let mut check_interval = tokio::time::interval(duration);
+    info!(interval = ?duration, "periodic checks scheduled");
 
     loop {
         check_interval.tick().await;
         info!("Periodic update check");
-        match check_updates(&args).await {
+        match check_updates(&settings).await {
             Ok(new_state) => {
                 *daemon.state.write().await = new_state;
             }
