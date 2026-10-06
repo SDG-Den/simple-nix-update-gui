@@ -2,8 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration as StdDuration;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zbus::{dbus_interface, ConnectionBuilder};
@@ -117,32 +118,28 @@ async fn check_updates(args: &Args) -> Result<UpdateState> {
         args.flake_uri, system_name
     );
 
+    // lib.nixosSystem has no `system` attribute. The built system path lives at
+    // config.system.build.toplevel, which is what /run/booted-system points at.
     let eval_cmd = format!(
-        "{}#nixosConfigurations.{}.system",
+        "{}#nixosConfigurations.{}.config.system.build.toplevel",
         args.flake_uri.trim_end_matches('/'),
         system_name
     );
 
-    let (has_update, remote_system, last_error) =
-        match timeout(EVAL_TIMEOUT, eval_remote_system(eval_cmd)).await {
-            Ok(Ok(remote)) => {
-                let has_update = remote != current_system;
-                info!(
-                    "Update check result: has_update={}, current={}, remote={}",
-                    has_update, current_system, remote
-                );
-                (has_update, Some(remote), None)
-            }
-            Ok(Err(message)) => {
-                warn!("nix eval failed: {}", message);
-                (false, None, Some(message))
-            }
-            Err(_) => {
-                let message = format!("nix eval did not finish within {:?}", EVAL_TIMEOUT);
-                warn!("{}", message);
-                (false, None, Some(message))
-            }
-        };
+    let (has_update, remote_system, last_error) = match eval_remote_system(eval_cmd) {
+        Ok(remote) => {
+            let has_update = remote != current_system;
+            info!(
+                "Update check result: has_update={}, current={}, remote={}",
+                has_update, current_system, remote
+            );
+            (has_update, Some(remote), None)
+        }
+        Err(message) => {
+            warn!("nix eval failed: {}", message);
+            (false, None, Some(message))
+        }
+    };
 
     Ok(UpdateState {
         has_update,
@@ -158,19 +155,32 @@ async fn check_updates(args: &Args) -> Result<UpdateState> {
 /// Runs the eval the check hinges on and returns the remote system store path,
 /// or the reason it could not be had. Lossy decoding keeps a stray non UTF-8
 /// byte in nix's output from hiding the message that matters.
-async fn eval_remote_system(eval_cmd: String) -> Result<String, String> {
-    let spawned = tokio::task::spawn_blocking(move || {
-        Command::new("nix")
+///
+/// This stays on std rather than tokio on purpose. zbus dispatches method calls
+/// on its own executor, not on the runtime #[tokio::main] builds, so a tokio
+/// timer or spawn_blocking here panics with "no reactor running" whenever the
+/// check is entered over D-Bus.
+fn eval_remote_system(eval_cmd: String) -> Result<String, String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = Command::new("nix")
             .arg("eval")
             .arg("--no-write-lock-file")
             .arg("--raw")
             .arg(eval_cmd)
-            .output()
-    })
-    .await
-    .map_err(|e| format!("nix eval task failed: {e}"))?;
+            .output();
+        let _ = sender.send(outcome);
+    });
 
-    let output = spawned.map_err(|e| format!("could not run nix eval: {e}"))?;
+    let output = match receiver.recv_timeout(EVAL_TIMEOUT) {
+        Ok(outcome) => outcome.map_err(|e| format!("could not run nix eval: {e}"))?,
+        Err(RecvTimeoutError::Timeout) => {
+            return Err(format!("nix eval did not finish within {EVAL_TIMEOUT:?}"));
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            return Err("nix eval thread ended without a result".to_string());
+        }
+    };
 
     if output.status.success() {
         Ok(text(&output.stdout))
@@ -229,7 +239,9 @@ async fn main() -> Result<()> {
         args: args.clone(),
     };
 
-    let _conn = ConnectionBuilder::system()?
+    // Session bus, not system bus. The daemon runs as the logged in user in a
+    // systemd user unit, and needs their HOME so git can find their credentials.
+    let _conn = ConnectionBuilder::session()?
         .name(args.bus_name.clone())?
         .serve_at("/org/simple_nix_update_gui/Daemon", daemon.clone())?
         .build()

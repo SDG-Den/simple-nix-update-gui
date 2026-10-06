@@ -600,7 +600,7 @@ fn parse_interval(interval: &str) -> Duration {
 }
 
 async fn daemon_proxy(bus_name: &str) -> Result<zbus::Proxy<'_>> {
-    let connection = zbus::Connection::system().await?;
+    let connection = zbus::Connection::session().await?;
     zbus::Proxy::new(
         &connection,
         bus_name,

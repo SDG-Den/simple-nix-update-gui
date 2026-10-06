@@ -1,5 +1,5 @@
 {
-  description = "Simple NixOS update GUI with system bus state daemon";
+  description = "Simple NixOS update GUI with per-user session bus state daemon";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";

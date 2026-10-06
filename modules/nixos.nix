@@ -40,40 +40,6 @@ with lib; let
     "SNU_USE_NOM=${boolToString cfg.useNom}"
   ];
 
-  # The daemon owns a name on the system bus, which needs a service file so the bus
-  # knows the executable, and a policy file so only root may own the name while any
-  # caller may invoke the interface. Both are named after cfg.busName, and
-  # services.dbus.packages picks up share/dbus-1/system-services and
-  # share/dbus-1/system.d from a package.
-  dbusFiles = pkgs.runCommand "simple-nix-update-gui-dbus" {
-    serviceFile = pkgs.writeText "${cfg.busName}.service" ''
-      [D-BUS Service]
-      Name=${cfg.busName}
-      Exec=${daemon}/bin/simple-nix-update-gui-daemon
-      User=root
-      SystemdService=simple-nix-update-gui-daemon.service
-    '';
-
-    policyFile = pkgs.writeText "${cfg.busName}.conf" ''
-      <?xml version="1.0" encoding="UTF-8"?>
-      <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
-       "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-      <busconfig>
-        <policy user="root">
-          <allow own="${cfg.busName}"/>
-        </policy>
-        <policy context="default">
-          <allow send_destination="${cfg.busName}"/>
-          <allow send_interface="org.simple_nix_update_gui.Daemon"/>
-        </policy>
-      </busconfig>
-    '';
-  } ''
-    mkdir -p $out/share/dbus-1/system-services $out/share/dbus-1/system.d
-    cp $serviceFile $out/share/dbus-1/system-services/
-    cp $policyFile $out/share/dbus-1/system.d/
-  '';
-
   daemonPath = concatStringsSep ":" [
     "${pkgs.nix}/bin"
     "${pkgs.git}/bin"
@@ -109,7 +75,7 @@ in
       type = types.str;
       default = "org.simple_nix_update_gui.Daemon";
       description = ''
-        Well known name the daemon owns on the system bus. The GUI is told the same
+        Well known name the daemon owns on the session bus. The GUI is told the same
         name, so changing it here needs no change elsewhere.
       '';
     };
@@ -169,7 +135,9 @@ in
       })
     ];
 
-    services.dbus.packages = [ dbusFiles ];
+    # No D-Bus activation file. The session bus only consults those under a
+    # per-user data dir, and systemd.user.services already starts the daemon at
+    # login, so activation would be redundant.
 
     environment.etc = optionalAttrs cfg.trayAutostart {
       "xdg/autostart/simple-nix-update-gui-tray.desktop".source = pkgs.makeDesktopItem {
@@ -182,11 +150,15 @@ in
       };
     };
 
-    systemd.services.simple-nix-update-gui-daemon = {
+    # A user unit, not a system one, so it runs as whoever logged in. That is
+    # what lets the eval reach a private flake: nix shells out to git, which
+    # reads the credentials in that user's ~/.git-credentials. default.target is
+    # reached at every login, so this starts per session without a login hook.
+    # No network-online.target: the user manager has no such unit, and a failed
+    # eval surfaces to the GUI and is retried on the next interval anyway.
+    systemd.user.services.simple-nix-update-gui-daemon = {
       description = "Simple Nix update GUI state daemon";
-      wantedBy = ["multi-user.target"];
-      after = ["network-online.target"];
-      wants = ["network-online.target"];
+      wantedBy = ["default.target"];
       unitConfig = {
         StartLimitIntervalSec = "300";
         StartLimitBurst = 5;
@@ -196,7 +168,6 @@ in
         BusName = cfg.busName;
         Restart = "on-failure";
         RestartSec = "60s";
-        User = "root";
         Environment =
           settingsEnv
           ++ [
