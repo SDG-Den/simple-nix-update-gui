@@ -149,14 +149,17 @@ in
         "simple-nix-update-gui/settings.env".text = lib.concatStringsSep "\n" (settingsEnv ++ [""]);
       }
       // optionalAttrs cfg.trayAutostart {
-        "xdg/autostart/simple-nix-update-gui-tray.desktop".source = pkgs.makeDesktopItem {
-          name = "simple-nix-update-gui-tray";
-          exec = "${gui}/bin/simple-nix-update-gui ${cliFlags} --tray";
-          desktopName = "Simple Nix Update GUI";
-          icon = "system-software-update";
-          comment = "Tray icon for the Simple NixOS update GUI";
-          terminal = false;
-        };
+        # makeDesktopItem builds a directory; etc sources the .desktop file out
+        # of it so the autostart dir gets a regular file the generator can parse.
+        "xdg/autostart/simple-nix-update-gui-tray.desktop".source =
+          "${pkgs.makeDesktopItem {
+            name = "simple-nix-update-gui-tray";
+            exec = "${gui}/bin/simple-nix-update-gui ${cliFlags} --tray";
+            desktopName = "Simple Nix Update GUI";
+            icon = "system-software-update";
+            comment = "Tray icon for the Simple NixOS update GUI";
+            terminal = false;
+          }}/share/applications/simple-nix-update-gui-tray.desktop";
       };
 
     # A user unit, not a system one, so it runs as whoever logged in. That is

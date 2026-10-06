@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use gtk4::{self, glib, Box as GtkBox, Button, Dialog, Label, Orientation, ScrolledWindow};
+use gtk4::{self, glib, Box as GtkBox, Button, Label, Orientation, ScrolledWindow};
 use ksni::{Category, Status, TrayMethods};
 use libadwaita::prelude::*;
 use libadwaita::{
@@ -319,7 +319,7 @@ struct Window {
     remote_label: Label,
     status_label: Label,
     last_check_label: Label,
-    update_button: Button,
+    rebuild_buttons: Vec<Button>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -439,6 +439,23 @@ fn show_state(ui: &Rc<RefCell<Option<Window>>>, state: &UpdateState) {
     let Some(window) = borrowed.as_ref() else {
         return;
     };
+
+    // Both fields are None only in the initial state the daemon serves before
+    // its first eval finishes, so this is the exact "no result yet" signal.
+    let no_result = state.remote_system.is_none() && state.last_error.is_none();
+    if no_result {
+        window.banner.set_title("No daemon result yet, waiting for the first check");
+        window.banner.set_revealed(true);
+        window
+            .current_label
+            .set_text(&format!("Current: {}", state.current_system));
+        window.remote_label.set_text("Remote: (none)");
+        window.status_label.set_text("Status: waiting for first check");
+        window.last_check_label.set_text("Last check: never");
+        set_rebuild_buttons(&window.rebuild_buttons, false);
+        return;
+    }
+
     window.banner.set_revealed(false);
     window
         .current_label
@@ -463,7 +480,13 @@ fn show_state(ui: &Rc<RefCell<Option<Window>>>, state: &UpdateState) {
     window
         .last_check_label
         .set_text(&format!("Last check: {}", state.last_check));
-    window.update_button.set_sensitive(state.has_update);
+    set_rebuild_buttons(&window.rebuild_buttons, state.has_update);
+}
+
+fn set_rebuild_buttons(buttons: &[Button], sensitive: bool) {
+    for button in buttons {
+        button.set_sensitive(sensitive);
+    }
 }
 
 fn show_daemon_down(ui: &Rc<RefCell<Option<Window>>>, reason: &str) {
@@ -471,11 +494,12 @@ fn show_daemon_down(ui: &Rc<RefCell<Option<Window>>>, reason: &str) {
     let Some(window) = borrowed.as_ref() else {
         return;
     };
+    window.banner.set_title("Update daemon unavailable");
     window.banner.set_revealed(true);
     window.status_label.set_text(&format!(
         "Status: update daemon unavailable ({reason}), using local settings"
     ));
-    window.update_button.set_sensitive(false);
+    set_rebuild_buttons(&window.rebuild_buttons, false);
 }
 
 fn build_window(
@@ -486,13 +510,16 @@ fn build_window(
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Simple Nix Update GUI")
-        .default_width(600)
-        .default_height(400)
+        .default_width(760)
+        .default_height(600)
         .build();
 
     let header = HeaderBar::new();
-    let banner = Banner::builder().title("Update daemon unavailable").build();
-    banner.set_button_label(Some("Retry"));
+    let banner = Banner::builder()
+        .title("No daemon result yet, waiting for the first check")
+        .build();
+    banner.set_button_label(Some("Check now"));
+    banner.set_revealed(true);
     let banner_check_tx = check_tx.clone();
     banner.connect_button_clicked(move |_| {
         let _ = banner_check_tx.send(());
@@ -538,16 +565,34 @@ fn build_window(
         .xalign(0.0)
         .build();
 
-    let update_button = Button::builder().label("Update...").build();
-    let dialog_flake = settings.flake_uri.clone();
-    let dialog_system = settings.system_name.clone();
-    let dialog_use_nom = settings.use_nom;
-    update_button.connect_clicked(move |_| {
-        show_update_dialog(&dialog_flake, &dialog_system, dialog_use_nom);
-    });
+    let action_box = GtkBox::new(Orientation::Horizontal, 8);
+
+    let terminal_area = GtkBox::new(Orientation::Vertical, 0);
+    terminal_area.set_vexpand(true);
+    terminal_area.set_visible(false);
+
+    let mut rebuild_buttons = Vec::new();
+    for (action, label) in [
+        ("build", "rebuild (test rebuild only)"),
+        ("boot", "rebuild (switch on next reboot)"),
+        ("switch", "rebuild (switch now)"),
+    ] {
+        let button = Button::builder().label(label).build();
+        button.set_sensitive(false);
+        let flake_uri = settings.flake_uri.clone();
+        let system_name = settings.system_name.clone();
+        let use_nom = settings.use_nom;
+        let terminal_area = terminal_area.clone();
+        button.connect_clicked(move |_| {
+            run_nixos_rebuild(&terminal_area, action, &flake_uri, &system_name, use_nom);
+        });
+        action_box.append(&button);
+        rebuild_buttons.push(button);
+    }
 
     let reboot_button = Button::builder().label("Check reboot needed").build();
     reboot_button.connect_clicked(|_| check_and_prompt_reboot());
+    action_box.append(&reboot_button);
 
     vbox.append(&flake_label);
     vbox.append(&system_label);
@@ -555,8 +600,8 @@ fn build_window(
     vbox.append(&remote_label);
     vbox.append(&status_label);
     vbox.append(&last_check_label);
-    vbox.append(&update_button);
-    vbox.append(&reboot_button);
+    vbox.append(&action_box);
+    vbox.append(&terminal_area);
 
     let view = ToolbarView::new();
     view.add_top_bar(&header);
@@ -583,68 +628,21 @@ fn build_window(
         remote_label,
         status_label,
         last_check_label,
-        update_button,
+        rebuild_buttons,
     }
 }
 
-fn show_update_dialog(flake_uri: &str, system_name: &str, use_nom: bool) {
-    let dialog = Dialog::builder()
-        .title("Choose update action")
-        .default_width(500)
-        .build();
-
-    let content = dialog.content_area();
-    let vbox = GtkBox::new(Orientation::Vertical, 12);
-    vbox.set_margin_top(12);
-    vbox.set_margin_bottom(12);
-    vbox.set_margin_start(12);
-    vbox.set_margin_end(12);
-
-    let info = Label::builder()
-        .label(format!("Flake: {}#{}", flake_uri, system_name))
-        .xalign(0.0)
-        .wrap(true)
-        .build();
-
-    let test_btn = Button::builder()
-        .label("Test build (nixos-rebuild build)")
-        .build();
-    let boot_btn = Button::builder()
-        .label("Rebuild and boot (nixos-rebuild boot)")
-        .build();
-    let switch_btn = Button::builder()
-        .label("Rebuild and switch (nixos-rebuild switch)")
-        .build();
-
-    for (button, action) in [
-        (&test_btn, "build"),
-        (&boot_btn, "boot"),
-        (&switch_btn, "switch"),
-    ] {
-        let flake_uri = flake_uri.to_string();
-        let system_name = system_name.to_string();
-        button.connect_clicked(move |_| {
-            run_nixos_rebuild(action, &flake_uri, &system_name, use_nom);
-        });
+fn run_nixos_rebuild(
+    terminal_area: &GtkBox,
+    action: &str,
+    flake_uri: &str,
+    system_name: &str,
+    use_nom: bool,
+) {
+    while let Some(child) = terminal_area.first_child() {
+        terminal_area.remove(&child);
     }
 
-    vbox.append(&info);
-    vbox.append(&test_btn);
-    vbox.append(&boot_btn);
-    vbox.append(&switch_btn);
-    content.append(&vbox);
-
-    dialog.show();
-}
-
-fn run_nixos_rebuild(action: &str, flake_uri: &str, system_name: &str, use_nom: bool) {
-    let dialog = Dialog::builder()
-        .title(format!("nixos-rebuild {}", action))
-        .default_width(900)
-        .default_height(600)
-        .build();
-
-    let content = dialog.content_area();
     let terminal = Terminal::new();
     terminal.spawn_async(
         PtyFlags::DEFAULT,
@@ -667,19 +665,19 @@ fn run_nixos_rebuild(action: &str, flake_uri: &str, system_name: &str, use_nom: 
         .hexpand(true)
         .vexpand(true)
         .build();
-    content.append(&scroll);
-
-    dialog.show();
+    terminal_area.append(&scroll);
+    terminal_area.set_visible(true);
 }
 
-/// boot and switch need root, so they run through pkexec, which raises the
-/// polkit agent popup. build only evaluates and builds, so it stays unprivileged.
+/// boot and switch need root, so they run through sudo, which prompts for a
+/// password inside the integrated terminal. build only evaluates and builds, so
+/// it stays unprivileged.
 fn build_command(action: &str, flake_uri: &str, system_name: &str, use_nom: bool) -> String {
     let flake = format!("{}#{}", flake_uri, system_name);
     let rebuild = if action == "build" {
         format!("nixos-rebuild {} --flake '{}'", action, flake)
     } else {
-        format!("pkexec nixos-rebuild {} --flake '{}'", action, flake)
+        format!("sudo nixos-rebuild {} --flake '{}'", action, flake)
     };
     if use_nom {
         format!(
@@ -714,10 +712,9 @@ fn check_and_prompt_reboot() {
         .build();
     dialog.connect_response(move |d, response| {
         if response == gtk4::ResponseType::Yes {
-            let _ = Command::new("pkexec")
-                .arg("systemctl")
-                .arg("reboot")
-                .spawn();
+            // module's polkit rule grants wheel the login1.reboot action, so a
+            // user systemctl reboot needs no password
+            let _ = Command::new("systemctl").arg("reboot").spawn();
         }
         d.close();
     });
