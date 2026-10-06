@@ -671,7 +671,8 @@ fn run_nixos_rebuild(
 
 /// boot and switch need root, so they run through sudo, which prompts for a
 /// password inside the integrated terminal. build only evaluates and builds, so
-/// it stays unprivileged.
+/// it stays unprivileged. Under nom the prompt would be swallowed by nom's tui,
+/// so privileged runs first authenticate with a throwaway sudo command.
 fn build_command(action: &str, flake_uri: &str, system_name: &str, use_nom: bool) -> String {
     let flake = format!("{}#{}", flake_uri, system_name);
     let rebuild = if action == "build" {
@@ -679,10 +680,14 @@ fn build_command(action: &str, flake_uri: &str, system_name: &str, use_nom: bool
     } else {
         format!("sudo nixos-rebuild {} --flake '{}'", action, flake)
     };
+    let preauth = if action == "build" {
+        String::new()
+    } else {
+        "sudo echo \"Starting update\" && ".to_string()
+    };
     if use_nom {
         format!(
-            "if command -v nom >/dev/null 2>&1; then {} 2>&1 | nom; else {} 2>&1; fi",
-            rebuild, rebuild
+            "if command -v nom >/dev/null 2>&1; then {preauth}{rebuild} 2>&1 | nom; else {rebuild} 2>&1; fi"
         )
     } else {
         format!("{} 2>&1", rebuild)
