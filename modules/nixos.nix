@@ -27,6 +27,7 @@ with lib; let
     (flag "auto-notify" (boolToString cfg.autoNotify))
     (flag "check-interval" cfg.checkInterval)
     (flag "bus-name" cfg.busName)
+    (flag "clone-path" cfg.clonePath)
   ];
 
   # Booleans are always written out, including when false, because both binaries
@@ -38,6 +39,7 @@ with lib; let
     "SNU_BUS_NAME=${cfg.busName}"
     "SNU_AUTO_NOTIFY=${boolToString cfg.autoNotify}"
     "SNU_USE_NOM=${boolToString cfg.useNom}"
+    "SNU_CLONE_PATH=${cfg.clonePath}"
   ];
 
   daemonPath = concatStringsSep ":" [
@@ -104,6 +106,16 @@ in
       default = true;
       description = ''
         Use nix-output-monitor (nom) for build output in integrated terminal if available.
+      '';
+    };
+
+    clonePath = mkOption {
+      type = types.str;
+      default = "$HOME/repos/nix-config";
+      description = ''
+        Local directory the GUI clones or updates (as the invoking user, before any
+        sudo) when flakeUri is a git+ URI, then rebuilds from. $HOME and ~ expand
+        at runtime to the user running the GUI.
       '';
     };
 

@@ -12,7 +12,7 @@ logs each setting with its source on startup.
 | Source | Meaning |
 |--------|---------|
 | CLI flag | `--flake-uri="..."`, `--use-nom=false`, etc. |
-| Environment | `SNU_FLAKE_URI`, `SNU_SYSTEM_NAME`, `SNU_CHECK_INTERVAL`, `SNU_BUS_NAME`, `SNU_USE_NOM`, `SNU_AUTO_NOTIFY` |
+| Environment | `SNU_FLAKE_URI`, `SNU_SYSTEM_NAME`, `SNU_CHECK_INTERVAL`, `SNU_BUS_NAME`, `SNU_USE_NOM`, `SNU_AUTO_NOTIFY`, `SNU_CLONE_PATH` |
 | Settings file | `/etc/simple-nix-update-gui/settings.env` (written by the module as `KEY=value` lines) |
 | Builtin default | The hardcoded fallback value |
 
@@ -42,6 +42,7 @@ initial check immediately at startup and then keeps checking on
 | `--auto-notify` | `SNU_AUTO_NOTIFY` | `true` | Send a desktop notification the first time an update is seen, and on every later `no update -> update` transition |
 | `--check-interval` | `SNU_CHECK_INTERVAL` | `1h` | How often the GUI asks the daemon for state |
 | `--bus-name` | `SNU_BUS_NAME` | `org.simple_nix_update_gui.Daemon` | Well known name to look for on the session bus |
+| `--clone-path` | `SNU_CLONE_PATH` | `$HOME/repos/nix-config` | Local directory the GUI clones or pulls as the invoking user before rebuilds, when `flakeUri` is a `git+` URI. `$HOME` and `~` expand at startup |
 | `--tray` | (none) | off | Start hidden with a status icon instead of showing the window |
 
 Booleans are always written out explicitly by the NixOS module, including when
@@ -60,6 +61,7 @@ false, because both binaries fall back to `true` when a value is absent. Use
 | `services.simple-nix-update-gui.autoNotify` | bool | `true` | Let the GUI notify when an update becomes available |
 | `services.simple-nix-update-gui.useNom` | bool | `true` | Use nom in integrated terminal |
 | `services.simple-nix-update-gui.trayAutostart` | bool | `true` | Add the `xdg/autostart` entry that starts the GUI with `--tray` |
+| `services.simple-nix-update-gui.clonePath` | str | `"$HOME/repos/nix-config"` | Local directory the GUI clones or pulls (as the invoking user, before any sudo) when `flakeUri` is a `git+` URI, then rebuilds from |
 
 The module starts the daemon through a `systemd.user` unit, adds the tray
 autostart and launcher desktop entries, writes
@@ -71,6 +73,6 @@ autostart and launcher desktop entries, writes
 1. **Update detection**: Compares the path of the currently booted system (`/run/booted-system`, symlink to a store path) with the evaluated system derivation for `flakeUri#nixosConfigurations.<systemName>.system`. If they differ, an update is available.
 2. **Reboot detection**: Compares booted system against the current system profile (`/nix/var/nix/profiles/system`). If different, a reboot is needed to activate changes.
 3. **Notifications**: The GUI sends a desktop notification via `notify-rust` the first time it sees an update, and again on each `no update -> update` transition. The daemon itself sends none.
-4. **Rebuilds**: The GUI launches `nixos-rebuild` with the chosen action in an embedded VTE terminal. `build` runs unprivileged; `boot` and `switch` run through `pkexec`, so the desktop polkit agent asks for authentication instead of failing on a missing password prompt. Output can be piped through `nom` for better formatting.
+4. **Rebuilds**: The GUI first clones or pulls the flake repository into `clonePath` as the invoking user, so the git operation keeps that user's credentials and the rebuild itself never needs them. It then launches `nixos-rebuild` against the local path with the chosen action in an embedded VTE terminal. `build` runs unprivileged; `boot` and `switch` run through `sudo`, which prompts for a password in the terminal. Output can be piped through `nom` for better formatting. Non-`git+` flake URIs skip the clone step and are used directly.
 5. **Tray**: With `--tray`, the GUI starts without a window, shows a status icon (Open, Check now, Quit), and closing the window hides it instead of exiting. Without `--tray`, closing the window exits, because there would be no icon to bring the window back.
 6. **Daemon unavailable**: The GUI shows a banner, keeps working with its own `flakeUri`/`systemName`, and retries when the banner's Retry button is pressed.

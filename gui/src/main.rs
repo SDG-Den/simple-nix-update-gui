@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser};
-use gtk4::{self, glib, Box as GtkBox, Button, Label, Orientation, ScrolledWindow};
+use gtk4::{self, gdk::RGBA, glib, Box as GtkBox, Button, Label, Orientation, ScrolledWindow};
 use ksni::{Category, Status, TrayMethods};
 use libadwaita::prelude::*;
 use libadwaita::{
@@ -48,6 +48,8 @@ struct Args {
     auto_notify: Option<bool>,
     #[arg(long, env = "SNU_BUS_NAME")]
     bus_name: Option<String>,
+    #[arg(long, env = "SNU_CLONE_PATH")]
+    clone_path: Option<String>,
     #[arg(long)]
     tray: bool,
 }
@@ -62,6 +64,7 @@ struct Settings {
     system_name: String,
     check_interval: String,
     bus_name: String,
+    clone_path: String,
     use_nom: bool,
     auto_notify: bool,
     tray: bool,
@@ -95,6 +98,15 @@ fn build_settings(args: &Args) -> Settings {
     );
     tracing::info!(setting = "bus_name", value = %bus_name, source = bus_name_source);
 
+    let (clone_path, clone_path_source) = resolve_str(
+        &args.clone_path,
+        "SNU_CLONE_PATH",
+        &file,
+        "$HOME/repos/nix-config",
+    );
+    let clone_path = expand_home(&clone_path);
+    tracing::info!(setting = "clone_path", value = %clone_path, source = clone_path_source);
+
     let (use_nom, use_nom_source) = resolve_bool(&args.use_nom, "SNU_USE_NOM", &file, true);
     tracing::info!(
         setting = "use_nom",
@@ -122,6 +134,7 @@ fn build_settings(args: &Args) -> Settings {
         system_name,
         check_interval,
         bus_name,
+        clone_path,
         use_nom,
         auto_notify,
         tray,
@@ -146,6 +159,24 @@ fn resolve_str(
     } else {
         (default.to_string(), "builtin default")
     }
+}
+
+/// The module is system-wide, so a clone path default like $HOME/repos/nix-config
+/// reaches the GUI unexpanded. Expanding it here keeps the value correct for
+/// whichever user started the GUI, before it is single-quoted into the shell
+/// command where it would no longer expand.
+fn expand_home(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        return format!("{}/{}", home, rest);
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("{}/{}", home, rest);
+    }
+    if path == "$HOME" || path == "~" {
+        return home;
+    }
+    path.to_string()
 }
 
 fn resolve_bool(
@@ -444,13 +475,17 @@ fn show_state(ui: &Rc<RefCell<Option<Window>>>, state: &UpdateState) {
     // its first eval finishes, so this is the exact "no result yet" signal.
     let no_result = state.remote_system.is_none() && state.last_error.is_none();
     if no_result {
-        window.banner.set_title("No daemon result yet, waiting for the first check");
+        window
+            .banner
+            .set_title("No daemon result yet, waiting for the first check");
         window.banner.set_revealed(true);
         window
             .current_label
             .set_text(&format!("Current: {}", state.current_system));
         window.remote_label.set_text("Remote: (none)");
-        window.status_label.set_text("Status: waiting for first check");
+        window
+            .status_label
+            .set_text("Status: waiting for first check");
         window.last_check_label.set_text("Last check: never");
         set_rebuild_buttons(&window.rebuild_buttons, false);
         return;
@@ -581,10 +616,18 @@ fn build_window(
         button.set_sensitive(false);
         let flake_uri = settings.flake_uri.clone();
         let system_name = settings.system_name.clone();
+        let clone_path = settings.clone_path.clone();
         let use_nom = settings.use_nom;
         let terminal_area = terminal_area.clone();
         button.connect_clicked(move |_| {
-            run_nixos_rebuild(&terminal_area, action, &flake_uri, &system_name, use_nom);
+            run_nixos_rebuild(
+                &terminal_area,
+                action,
+                &flake_uri,
+                &clone_path,
+                &system_name,
+                use_nom,
+            );
         });
         action_box.append(&button);
         rebuild_buttons.push(button);
@@ -632,10 +675,86 @@ fn build_window(
     }
 }
 
+/// VTE paints its own canvas and ignores GTK CSS, so the active theme's
+/// named colors are looked up and applied when a rebuild terminal is
+/// created. Only names the theme defines are used; other palette slots
+/// fall back to standard dark ANSI colors because VTE requires the full
+/// 0/8/16/232/256 palette size.
+#[allow(deprecated)]
+fn apply_gtk_theme_colors(terminal: &Terminal) {
+    let context = terminal.style_context();
+    let lookup = |name: &str| context.lookup_color(name);
+
+    let foreground = ["theme_fg_color", "view_fg_color", "window_fg_color"]
+        .iter()
+        .find_map(|name| lookup(name));
+    let background = ["theme_bg_color", "view_bg_color", "window_bg_color"]
+        .iter()
+        .find_map(|name| lookup(name));
+
+    let candidates: [&[&str]; 16] = [
+        &[],
+        &["red_1", "error_color", "destructive_color"],
+        &["green_1", "success_color"],
+        &["yellow_1", "warning_color"],
+        &["blue_1", "accent_bg_color", "accent_color"],
+        &["purple_1"],
+        &[],
+        &["light_1", "window_fg_color"],
+        &["dark_2", "headerbar_bg_color"],
+        &["red_1", "error_color", "destructive_color"],
+        &["green_1", "success_color"],
+        &["yellow_1", "warning_color"],
+        &["blue_1", "accent_bg_color", "accent_color"],
+        &["purple_1"],
+        &[],
+        &["light_5", "window_fg_color"],
+    ];
+    let fallbacks: [&str; 16] = [
+        "#2e3436", "#cc0000", "#4e9a06", "#c4a000", //
+        "#3465a4", "#75507b", "#06989a", "#d3d7cf", "#555753", "#ef2929", "#8ae234", "#fce94f",
+        "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec",
+    ];
+
+    let mut from_theme = foreground.is_some() || background.is_some();
+    let mut palette = Vec::with_capacity(16);
+    for (names, fallback) in candidates.iter().zip(fallbacks) {
+        let theme_color = names.iter().find_map(|name| lookup(name));
+        if theme_color.is_some() {
+            from_theme = true;
+        }
+        let color = match theme_color {
+            Some(color) => color,
+            None => match fallback.parse::<RGBA>() {
+                Ok(color) => color,
+                Err(error) => {
+                    tracing::warn!(fallback, %error, "invalid ANSI fallback color");
+                    return;
+                }
+            },
+        };
+        palette.push(color);
+    }
+
+    if !from_theme {
+        tracing::info!("no GTK theme colors resolved, keeping VTE defaults");
+        return;
+    }
+
+    let palette_refs: Vec<&RGBA> = palette.iter().collect();
+    terminal.set_colors(foreground.as_ref(), background.as_ref(), &palette_refs);
+    tracing::info!(
+        foreground = foreground.is_some(),
+        background = background.is_some(),
+        "applied GTK theme colors to terminal"
+    );
+}
+
 fn run_nixos_rebuild(
     terminal_area: &GtkBox,
     action: &str,
     flake_uri: &str,
+    clone_path: &str,
     system_name: &str,
     use_nom: bool,
 ) {
@@ -644,13 +763,14 @@ fn run_nixos_rebuild(
     }
 
     let terminal = Terminal::new();
+    apply_gtk_theme_colors(&terminal);
     terminal.spawn_async(
         PtyFlags::DEFAULT,
         None,
         &[
             "/bin/sh",
             "-c",
-            &build_command(action, flake_uri, system_name, use_nom),
+            &build_command(action, flake_uri, clone_path, system_name, use_nom),
         ],
         &[],
         gtk4::glib::SpawnFlags::DEFAULT,
@@ -669,12 +789,58 @@ fn run_nixos_rebuild(
     terminal_area.set_visible(true);
 }
 
-/// boot and switch need root, so they run through sudo, which prompts for a
-/// password inside the integrated terminal. build only evaluates and builds, so
-/// it stays unprivileged. Under nom the prompt would be swallowed by nom's tui,
-/// so privileged runs first authenticate with a throwaway sudo command.
-fn build_command(action: &str, flake_uri: &str, system_name: &str, use_nom: bool) -> String {
-    let flake = format!("{}#{}", flake_uri, system_name);
+/// A git+ flake URI names a repository that a root-run nixos-rebuild cannot
+/// fetch: sudo resets HOME to /root, which holds no git credentials. So the
+/// command first clones or pulls the repository into clone_path as the
+/// invoking user, and the rebuild then runs from that local path. Returns the
+/// shell snippet (ending in "&& ") and the flake root to rebuild from;
+/// non-git URIs need no clone and come back unchanged.
+fn git_sync_command(flake_uri: &str, clone_path: &str) -> (String, String) {
+    let Some(rest) = flake_uri.strip_prefix("git+") else {
+        return (String::new(), flake_uri.to_string());
+    };
+    let (location, query) = match rest.split_once('?') {
+        Some((location, query)) => (location, query),
+        None => (rest, ""),
+    };
+    let mut flake_root = clone_path.to_string();
+    let mut ignored: Vec<&str> = Vec::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        match pair.split_once('=') {
+            Some(("dir", dir)) => flake_root = format!("{}/{}", clone_path, dir),
+            _ => ignored.push(pair),
+        }
+    }
+    let mut sync = String::new();
+    if !ignored.is_empty() {
+        sync.push_str(&format!(
+            "echo 'warning: ignoring flake URI params: {}' && ",
+            ignored.join(" ")
+        ));
+    }
+    sync.push_str(&format!(
+        "if [ -d '{clone}/.git' ]; then git -C '{clone}' pull; else mkdir -p '{clone}' && git clone '{url}' '{clone}'; fi && ",
+        clone = clone_path,
+        url = location,
+    ));
+    (sync, flake_root)
+}
+
+/// The git sync runs first, unprivileged, so the clone/pull uses the invoking
+/// user's credentials. boot and switch then need root, so they run through
+/// sudo, which prompts for a password inside the integrated terminal. build
+/// only evaluates and builds, so it stays unprivileged. Under nom the prompt
+/// would be swallowed by nom's tui, so privileged runs first authenticate with
+/// a throwaway sudo command.
+fn build_command(
+    action: &str,
+    flake_uri: &str,
+    clone_path: &str,
+    system_name: &str,
+    use_nom: bool,
+) -> String {
+    let (sync, flake_root) = git_sync_command(flake_uri, clone_path);
+    let flake = format!("{}#{}", flake_root, system_name);
     let rebuild = if action == "build" {
         format!("nixos-rebuild {} --flake '{}'", action, flake)
     } else {
@@ -687,10 +853,10 @@ fn build_command(action: &str, flake_uri: &str, system_name: &str, use_nom: bool
     };
     if use_nom {
         format!(
-            "if command -v nom >/dev/null 2>&1; then {preauth}{rebuild} 2>&1 | nom; else {rebuild} 2>&1; fi"
+            "if command -v nom >/dev/null 2>&1; then {sync}{preauth}{rebuild} 2>&1 | nom; else {sync}{rebuild} 2>&1; fi"
         )
     } else {
-        format!("{} 2>&1", rebuild)
+        format!("{}{} 2>&1", sync, rebuild)
     }
 }
 

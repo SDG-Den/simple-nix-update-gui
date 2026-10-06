@@ -61,6 +61,7 @@ cargo clippy --all-targets --all-features
 ### Permission issues with rebuilds
 
 - `nixos-rebuild` requires privileges. The GUI runs as the invoking user; use sudo/doas or rely on polkit rules configured by your system. The module sets up polkit rules allowing wheel group for power operations, but nixos-rebuild itself typically requires sudo elevation depending on your setup.
+- A `git+` flake URI is cloned or pulled into the clone path (default `$HOME/repos/nix-config`) as the invoking user before `sudo` runs, so root never needs git credentials. If the clone or pull fails, its error appears in the integrated terminal and the rebuild does not start.
 - Consider using `sudo` with NOPASSWD for specific commands if needed, or configure nix trusted users.
 
 ### Update detection seems incorrect
