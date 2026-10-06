@@ -24,6 +24,10 @@ use vte4::{PtyFlags, Terminal};
 
 const ICON_NAME: &str = "system-software-update";
 
+/// Shown as the notification's source. The notify-rust default is the
+/// filename of the running executable, which is the Nix wrapper.
+const NOTIFICATION_APP_NAME: &str = "Nix Updates";
+
 const SETTINGS_FILE: &str = "/etc/simple-nix-update-gui/settings.env";
 
 #[derive(Parser, Debug, Clone)]
@@ -291,6 +295,13 @@ impl ksni::Tray for UpdateTray {
     }
 
     fn icon_name(&self) -> String {
+        ICON_NAME.into()
+    }
+
+    /// The host switches to this one as soon as `status` is NeedsAttention and
+    /// falls back to the pixmap list when it is empty, which shows a
+    /// placeholder, so it has to be set even though it equals `icon_name`.
+    fn attention_icon_name(&self) -> String {
         ICON_NAME.into()
     }
 
@@ -1348,7 +1359,7 @@ fn spawn_poller(
                         flake_uri = %state.flake_uri,
                         "update available, sending notification"
                     );
-                    notify_update_available(&state).await;
+                    notify_update_available(&state, actions.clone()).await;
                 }
                 previous = Some(state.has_update);
 
@@ -1454,22 +1465,35 @@ fn spawn_progress_listener(
 /// notify-rust spins up its own tokio runtime on the calling thread, which
 /// panics with "Cannot start a runtime from within a runtime" when called on a
 /// tokio worker. spawn_blocking runs it on a blocking thread instead.
-async fn notify_update_available(state: &UpdateState) {
+async fn notify_update_available(state: &UpdateState, actions: UnboundedSender<UiAction>) {
     let body = format!(
         "Update available for {} ({})",
         state.system_name, state.flake_uri
     );
-    match tokio::task::spawn_blocking(move || {
-        notify_rust::Notification::new()
+    match tokio::task::spawn_blocking(move || -> Result<()> {
+        let handle = notify_rust::Notification::new()
             .summary("System updates")
             .body(&body)
             .icon(ICON_NAME)
+            .appname(NOTIFICATION_APP_NAME)
+            .action("open", "Open")
             .timeout(notify_rust::Timeout::Milliseconds(10000))
-            .show()
+            .show()?;
+        // Waiting for the action blocks until the button is pressed or the
+        // timeout closes the notification, so it gets a plain thread: on a
+        // tokio worker it would stall the poller for that whole time.
+        std::thread::spawn(move || {
+            handle.wait_for_action(|action| {
+                if action == "open" {
+                    let _ = actions.send(UiAction::OpenWindow);
+                }
+            });
+        });
+        Ok(())
     })
     .await
     {
-        Ok(Ok(_)) => tracing::info!("notification sent"),
+        Ok(Ok(())) => tracing::info!("notification sent"),
         Ok(Err(error)) => tracing::warn!(error = %error, "notification failed"),
         Err(error) => tracing::warn!(error = %error, "notification task panicked"),
     }
