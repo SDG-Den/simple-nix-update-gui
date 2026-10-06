@@ -183,8 +183,10 @@ impl Daemon {
 }
 
 async fn get_current_system() -> Result<String> {
+    // /run/booted-system is frozen at boot and ignores `nixos-rebuild switch`,
+    // so the active system, the one nixos-rebuild just activated, is read here.
     let output = Command::new("readlink")
-        .arg("/run/booted-system")
+        .arg("/run/current-system")
         .output()?;
     if !output.status.success() {
         // Fallback to profile
@@ -218,7 +220,7 @@ async fn check_updates(settings: &Settings) -> Result<UpdateState> {
     );
 
     // lib.nixosSystem has no `system` attribute. The built system path lives at
-    // config.system.build.toplevel, which is what /run/booted-system points at.
+    // config.system.build.toplevel, which is what /run/current-system points at.
     let eval_cmd = format!(
         "{}#nixosConfigurations.{}.config.system.build.toplevel",
         settings.flake_uri.trim_end_matches('/'),

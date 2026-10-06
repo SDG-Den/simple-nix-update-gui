@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser};
 use gtk4::{self, gdk::RGBA, glib, Box as GtkBox, Button, Label, Orientation, ScrolledWindow};
 use ksni::{Category, Status, TrayMethods};
@@ -19,6 +19,10 @@ use vte4::prelude::*;
 use vte4::{PtyFlags, Terminal};
 
 const ICON_NAME: &str = "system-software-update";
+
+// du walks the whole store, so stats are refreshed on their own slower timer
+// rather than on every poller tick.
+const STORE_STATS_REFRESH: Duration = Duration::from_secs(600);
 
 const SETTINGS_FILE: &str = "/etc/simple-nix-update-gui/settings.env";
 
@@ -261,6 +265,7 @@ struct UpdateState {
 /// that crosses between them.
 enum UiAction {
     State(Box<UpdateState>),
+    StoreStats(Result<Box<StoreStats>, String>),
     DaemonDown(String),
     OpenWindow,
     CheckNow,
@@ -350,6 +355,9 @@ struct Window {
     remote_label: Label,
     status_label: Label,
     last_check_label: Label,
+    store_size_label: Label,
+    disk_free_label: Label,
+    disk_total_label: Label,
     rebuild_buttons: Vec<Button>,
 }
 
@@ -407,17 +415,24 @@ async fn main() -> Result<()> {
     };
 
     spawn_poller(settings.clone(), actions_tx.clone(), check_rx, tray_handle);
+    spawn_store_stats(actions_tx.clone());
 
     let ui = Rc::new(RefCell::new(None::<Window>));
     let activate_ui = ui.clone();
     let activate_app = app.clone();
     let activate_settings = settings.clone();
     let activate_check_tx = check_tx.clone();
+    let activate_actions = actions_tx.clone();
     let start_hidden = settings.tray;
 
     app.connect_activate(move |_| {
         if activate_ui.borrow().is_none() {
-            let window = build_window(&activate_app, &activate_settings, &activate_check_tx);
+            let window = build_window(
+                &activate_app,
+                &activate_settings,
+                &activate_check_tx,
+                &activate_actions,
+            );
             *activate_ui.borrow_mut() = Some(window);
         }
         if !start_hidden {
@@ -449,6 +464,7 @@ fn apply_action(
 ) {
     match action {
         UiAction::State(state) => show_state(ui, &state),
+        UiAction::StoreStats(stats) => show_store_stats(ui, &stats),
         UiAction::DaemonDown(reason) => show_daemon_down(ui, &reason),
         UiAction::OpenWindow => {
             let borrowed = ui.borrow();
@@ -537,10 +553,44 @@ fn show_daemon_down(ui: &Rc<RefCell<Option<Window>>>, reason: &str) {
     set_rebuild_buttons(&window.rebuild_buttons, false);
 }
 
+fn show_store_stats(ui: &Rc<RefCell<Option<Window>>>, stats: &Result<Box<StoreStats>, String>) {
+    let borrowed = ui.borrow();
+    let Some(window) = borrowed.as_ref() else {
+        return;
+    };
+    match stats {
+        Ok(stats) => {
+            let store_pct = percent_of(stats.store_bytes, stats.disk_total_bytes);
+            let free_pct = percent_of(stats.disk_free_bytes, stats.disk_total_bytes);
+            window.store_size_label.set_text(&format!(
+                "Nix store: {} ({}% of disk)",
+                format_gb(stats.store_bytes),
+                store_pct
+            ));
+            window.disk_free_label.set_text(&format!(
+                "Disk free: {} ({}%)",
+                format_gb(stats.disk_free_bytes),
+                free_pct
+            ));
+            window.disk_total_label.set_text(&format!(
+                "Disk total: {}",
+                format_gb(stats.disk_total_bytes)
+            ));
+        }
+        Err(reason) => {
+            tracing::warn!(reason = %reason, "store stats unavailable");
+            window.store_size_label.set_text("Nix store: unavailable");
+            window.disk_free_label.set_text("Disk free: unavailable");
+            window.disk_total_label.set_text("Disk total: unavailable");
+        }
+    }
+}
+
 fn build_window(
     app: &AdwApplication,
     settings: &Settings,
     check_tx: &UnboundedSender<()>,
+    actions: &UnboundedSender<UiAction>,
 ) -> Window {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -600,6 +650,21 @@ fn build_window(
         .xalign(0.0)
         .build();
 
+    let store_size_label = Label::builder()
+        .label("Nix store: loading...")
+        .xalign(0.0)
+        .build();
+
+    let disk_free_label = Label::builder()
+        .label("Disk free: loading...")
+        .xalign(0.0)
+        .build();
+
+    let disk_total_label = Label::builder()
+        .label("Disk total: loading...")
+        .xalign(0.0)
+        .build();
+
     let action_box = GtkBox::new(Orientation::Horizontal, 8);
 
     let terminal_area = GtkBox::new(Orientation::Vertical, 0);
@@ -619,6 +684,7 @@ fn build_window(
         let clone_path = settings.clone_path.clone();
         let use_nom = settings.use_nom;
         let terminal_area = terminal_area.clone();
+        let refresh_actions = actions.clone();
         button.connect_clicked(move |_| {
             run_nixos_rebuild(
                 &terminal_area,
@@ -627,6 +693,7 @@ fn build_window(
                 &clone_path,
                 &system_name,
                 use_nom,
+                refresh_actions.clone(),
             );
         });
         action_box.append(&button);
@@ -637,12 +704,36 @@ fn build_window(
     reboot_button.connect_clicked(|_| check_and_prompt_reboot());
     action_box.append(&reboot_button);
 
+    let clean_button = Button::builder().label("Clean nix store").build();
+    {
+        let terminal_area = terminal_area.clone();
+        let flake_uri = settings.flake_uri.clone();
+        let system_name = settings.system_name.clone();
+        let clone_path = settings.clone_path.clone();
+        let use_nom = settings.use_nom;
+        let refresh_actions = actions.clone();
+        clean_button.connect_clicked(move |_| {
+            confirm_and_clean_store(
+                terminal_area.clone(),
+                flake_uri.clone(),
+                clone_path.clone(),
+                system_name.clone(),
+                use_nom,
+                refresh_actions.clone(),
+            );
+        });
+    }
+    action_box.append(&clean_button);
+
     vbox.append(&flake_label);
     vbox.append(&system_label);
     vbox.append(&current_label);
     vbox.append(&remote_label);
     vbox.append(&status_label);
     vbox.append(&last_check_label);
+    vbox.append(&store_size_label);
+    vbox.append(&disk_free_label);
+    vbox.append(&disk_total_label);
     vbox.append(&action_box);
     vbox.append(&terminal_area);
 
@@ -671,6 +762,9 @@ fn build_window(
         remote_label,
         status_label,
         last_check_label,
+        store_size_label,
+        disk_free_label,
+        disk_total_label,
         rebuild_buttons,
     }
 }
@@ -757,6 +851,16 @@ fn run_nixos_rebuild(
     clone_path: &str,
     system_name: &str,
     use_nom: bool,
+    refresh_actions: UnboundedSender<UiAction>,
+) {
+    let command = build_command(action, flake_uri, clone_path, system_name, use_nom);
+    run_in_terminal(terminal_area, &command, refresh_actions);
+}
+
+fn run_in_terminal(
+    terminal_area: &GtkBox,
+    command: &str,
+    refresh_actions: UnboundedSender<UiAction>,
 ) {
     while let Some(child) = terminal_area.first_child() {
         terminal_area.remove(&child);
@@ -764,14 +868,16 @@ fn run_nixos_rebuild(
 
     let terminal = Terminal::new();
     apply_gtk_theme_colors(&terminal);
+    terminal.connect_child_exited(move |_, _| {
+        let actions = refresh_actions.clone();
+        glib::spawn_future_local(async move {
+            refresh_store_stats(actions).await;
+        });
+    });
     terminal.spawn_async(
         PtyFlags::DEFAULT,
         None,
-        &[
-            "/bin/sh",
-            "-c",
-            &build_command(action, flake_uri, clone_path, system_name, use_nom),
-        ],
+        &["/bin/sh", "-c", command],
         &[],
         gtk4::glib::SpawnFlags::DEFAULT,
         || {},
@@ -787,6 +893,50 @@ fn run_nixos_rebuild(
         .build();
     terminal_area.append(&scroll);
     terminal_area.set_visible(true);
+}
+
+/// Asks before chaining the two garbage collections and the switch rebuild,
+/// since the first command drops profile generations older than 30 days.
+fn confirm_and_clean_store(
+    terminal_area: GtkBox,
+    flake_uri: String,
+    clone_path: String,
+    system_name: String,
+    use_nom: bool,
+    refresh_actions: UnboundedSender<UiAction>,
+) {
+    let dialog = gtk4::MessageDialog::builder()
+        .modal(true)
+        .text("Clean Nix store?")
+        .secondary_text(
+            "Runs nix-collect-garbage --delete-older-than 30d, then nix-collect-garbage, \
+             then rebuild (switch now). Generations older than 30 days are deleted.",
+        )
+        .message_type(gtk4::MessageType::Question)
+        .buttons(gtk4::ButtonsType::YesNo)
+        .build();
+    dialog.connect_response(move |d, response| {
+        if response == gtk4::ResponseType::Yes {
+            let command = build_clean_command(&flake_uri, &clone_path, &system_name, use_nom);
+            run_in_terminal(&terminal_area, &command, refresh_actions.clone());
+        }
+        d.close();
+    });
+    dialog.show();
+}
+
+/// The garbage collections run unprivileged, as written. The switch rebuild
+/// keeps the sudo, git sync, and nom handling build_command already applies.
+fn build_clean_command(
+    flake_uri: &str,
+    clone_path: &str,
+    system_name: &str,
+    use_nom: bool,
+) -> String {
+    format!(
+        "nix-collect-garbage --delete-older-than 30d && nix-collect-garbage && {}",
+        build_command("switch", flake_uri, clone_path, system_name, use_nom)
+    )
 }
 
 /// A git+ flake URI names a repository that a root-run nixos-rebuild cannot
@@ -1099,4 +1249,99 @@ fn get_hostname() -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string()
+}
+
+struct StoreStats {
+    store_bytes: u64,
+    disk_total_bytes: u64,
+    disk_free_bytes: u64,
+}
+
+/// Blocks while du walks the store, so it is only ever called from
+/// spawn_blocking. du reports on-disk usage (block allocation), df reports the
+/// size of the filesystem /nix/store lives on, which is not necessarily the
+/// root filesystem.
+fn collect_store_stats() -> Result<StoreStats> {
+    let du = Command::new("du")
+        .args(["-s", "-B1", "/nix/store"])
+        .output()
+        .context("running du")?;
+    if !du.status.success() {
+        bail!("du failed: {}", text(&du.stderr));
+    }
+    let store_bytes = text(&du.stdout)
+        .split_whitespace()
+        .next()
+        .context("du produced no output")?
+        .parse()
+        .context("du output was not a byte count")?;
+
+    let df = Command::new("df")
+        .args(["-B1", "--output=size,avail", "/nix/store"])
+        .output()
+        .context("running df")?;
+    if !df.status.success() {
+        bail!("df failed: {}", text(&df.stderr));
+    }
+    // Line 0 is the header, line 1 is the padded data row.
+    let df_output = text(&df.stdout);
+    let row = df_output
+        .lines()
+        .nth(1)
+        .context("df produced no data line")?;
+    let mut columns = row.split_whitespace();
+    let disk_total_bytes: u64 = columns
+        .next()
+        .context("df size column missing")?
+        .parse()
+        .context("df size was not a number")?;
+    let disk_free_bytes: u64 = columns
+        .next()
+        .context("df avail column missing")?
+        .parse()
+        .context("df avail was not a number")?;
+
+    Ok(StoreStats {
+        store_bytes,
+        disk_total_bytes,
+        disk_free_bytes,
+    })
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+fn format_gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1024f64.powi(3))
+}
+
+fn percent_of(part: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    part.saturating_mul(100) / total
+}
+
+async fn refresh_store_stats(actions: UnboundedSender<UiAction>) {
+    match tokio::task::spawn_blocking(collect_store_stats).await {
+        Ok(Ok(stats)) => {
+            let _ = actions.send(UiAction::StoreStats(Ok(Box::new(stats))));
+        }
+        Ok(Err(error)) => {
+            let _ = actions.send(UiAction::StoreStats(Err(error.to_string())));
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "store stats task panicked");
+        }
+    }
+}
+
+fn spawn_store_stats(actions: UnboundedSender<UiAction>) {
+    tokio::spawn(async move {
+        loop {
+            refresh_store_stats(actions.clone()).await;
+            tokio::time::sleep(STORE_STATS_REFRESH).await;
+        }
+    });
 }

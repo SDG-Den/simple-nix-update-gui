@@ -70,7 +70,7 @@ autostart and launcher desktop entries, writes
 
 ## Behavior
 
-1. **Update detection**: Compares the path of the currently booted system (`/run/booted-system`, symlink to a store path) with the evaluated system derivation for `flakeUri#nixosConfigurations.<systemName>.system`. If they differ, an update is available.
+1. **Update detection**: Compares the path of the active system (`/run/current-system`, symlink to a store path, updated by every activation) with the evaluated system derivation for `flakeUri#nixosConfigurations.<systemName>.system`. If they differ, an update is available.
 2. **Reboot detection**: Compares booted system against the current system profile (`/nix/var/nix/profiles/system`). If different, a reboot is needed to activate changes.
 3. **Notifications**: The GUI sends a desktop notification via `notify-rust` the first time it sees an update, and again on each `no update -> update` transition. The daemon itself sends none.
 4. **Rebuilds**: The GUI first clones or pulls the flake repository into `clonePath` as the invoking user, so the git operation keeps that user's credentials and the rebuild itself never needs them. It then launches `nixos-rebuild` against the local path with the chosen action in an embedded VTE terminal. `build` runs unprivileged; `boot` and `switch` run through `sudo`, which prompts for a password in the terminal. Output can be piped through `nom` for better formatting. Non-`git+` flake URIs skip the clone step and are used directly.
