@@ -13,7 +13,6 @@ A simple, desktop-friendly way to check for NixOS updates and perform rebuilds. 
 - Desktop notifications via `notify-rust`, once per `no update -> update` transition
 - Status icon (`ksni`) with Open, Check now, and Quit, and close-to-tray behavior
 - Desktop launcher entry and `xdg/autostart` entry, both carrying every setting as a flag
-- Checks if a reboot is needed (compares `/run/booted-system` to current profile)
 - Integrated terminal showing rebuild output (VTE)
 - `pkexec` for `nixos-rebuild boot`/`switch`, so a polkit agent can ask for the password
 - Optional `nix-output-monitor` (nom) support for nicer build logs

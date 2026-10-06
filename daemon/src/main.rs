@@ -267,6 +267,12 @@ fn eval_remote_system(eval_cmd: String) -> Result<String, String> {
         let outcome = Command::new("nix")
             .arg("eval")
             .arg("--no-write-lock-file")
+            // An unlocked git+ URL is re-resolved only once per tarball-ttl
+            // (3600s by default), so a fresh push would stay invisible to the
+            // check for up to an hour without this.
+            .arg("--option")
+            .arg("tarball-ttl")
+            .arg("0")
             .arg("--raw")
             .arg(eval_cmd)
             .output();

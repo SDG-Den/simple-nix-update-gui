@@ -1,6 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser};
-use gtk4::{self, gdk::RGBA, glib, Box as GtkBox, Button, Label, Orientation, ScrolledWindow};
+use gtk4::{
+    self, gdk::RGBA, glib, Box as GtkBox, Button, FlowBox, Label, Orientation, ScrolledWindow,
+    SelectionMode,
+};
 use ksni::{Category, Status, TrayMethods};
 use libadwaita::prelude::*;
 use libadwaita::{
@@ -620,23 +623,27 @@ fn build_window(
         .label(format!("Flake URI: {}", settings.flake_uri))
         .xalign(0.0)
         .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
         .build();
 
     let system_label = Label::builder()
         .label(format!("System: {}", settings.system_name))
         .xalign(0.0)
+        .wrap(true)
         .build();
 
     let current_label = Label::builder()
         .label("Current: unknown")
         .xalign(0.0)
         .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
         .build();
 
     let remote_label = Label::builder()
         .label("Remote: (none)")
         .xalign(0.0)
         .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
         .build();
 
     let status_label = Label::builder()
@@ -648,24 +655,32 @@ fn build_window(
     let last_check_label = Label::builder()
         .label("Last check: never")
         .xalign(0.0)
+        .wrap(true)
         .build();
 
     let store_size_label = Label::builder()
         .label("Nix store: loading...")
         .xalign(0.0)
+        .wrap(true)
         .build();
 
     let disk_free_label = Label::builder()
         .label("Disk free: loading...")
         .xalign(0.0)
+        .wrap(true)
         .build();
 
     let disk_total_label = Label::builder()
         .label("Disk total: loading...")
         .xalign(0.0)
+        .wrap(true)
         .build();
 
-    let action_box = GtkBox::new(Orientation::Horizontal, 8);
+    let action_box = FlowBox::new();
+    action_box.set_selection_mode(SelectionMode::None);
+    action_box.set_homogeneous(false);
+    action_box.set_row_spacing(8);
+    action_box.set_column_spacing(8);
 
     let terminal_area = GtkBox::new(Orientation::Vertical, 0);
     terminal_area.set_vexpand(true);
@@ -696,13 +711,9 @@ fn build_window(
                 refresh_actions.clone(),
             );
         });
-        action_box.append(&button);
+        action_box.insert(&button, -1);
         rebuild_buttons.push(button);
     }
-
-    let reboot_button = Button::builder().label("Check reboot needed").build();
-    reboot_button.connect_clicked(|_| check_and_prompt_reboot());
-    action_box.append(&reboot_button);
 
     let clean_button = Button::builder().label("Clean nix store").build();
     {
@@ -723,7 +734,7 @@ fn build_window(
             );
         });
     }
-    action_box.append(&clean_button);
+    action_box.insert(&clean_button, -1);
 
     vbox.append(&flake_label);
     vbox.append(&system_label);
@@ -740,7 +751,13 @@ fn build_window(
     let view = ToolbarView::new();
     view.add_top_bar(&header);
     view.add_top_bar(&banner);
-    view.set_content(Some(&vbox));
+
+    let scroller = ScrolledWindow::builder()
+        .child(&vbox)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    view.set_content(Some(&scroller));
     window.set_content(Some(&view));
 
     // Without a tray icon there would be no way back to a hidden window, so
@@ -1007,54 +1024,6 @@ fn build_command(
         )
     } else {
         format!("{}{} 2>&1", sync, rebuild)
-    }
-}
-
-fn check_and_prompt_reboot() {
-    if !is_reboot_needed_sync() {
-        let dialog = gtk4::MessageDialog::builder()
-            .modal(true)
-            .text("No reboot needed")
-            .secondary_text("Booted system matches current profile.")
-            .message_type(gtk4::MessageType::Info)
-            .buttons(gtk4::ButtonsType::Ok)
-            .build();
-        dialog.connect_response(|d, _| d.close());
-        dialog.show();
-        return;
-    }
-
-    let dialog = gtk4::MessageDialog::builder()
-        .modal(true)
-        .text("Reboot needed")
-        .secondary_text("A reboot is required to activate the new system.")
-        .message_type(gtk4::MessageType::Question)
-        .buttons(gtk4::ButtonsType::YesNo)
-        .build();
-    dialog.connect_response(move |d, response| {
-        if response == gtk4::ResponseType::Yes {
-            // module's polkit rule grants wheel the login1.reboot action, so a
-            // user systemctl reboot needs no password
-            let _ = Command::new("systemctl").arg("reboot").spawn();
-        }
-        d.close();
-    });
-    dialog.show();
-}
-
-fn is_reboot_needed_sync() -> bool {
-    let booted = Command::new("readlink").arg("/run/booted-system").output();
-    let profile = Command::new("readlink")
-        .arg("-f")
-        .arg("/nix/var/nix/profiles/system")
-        .output();
-    match (booted, profile) {
-        (Ok(booted), Ok(profile)) if booted.status.success() && profile.status.success() => {
-            let booted_path = String::from_utf8(booted.stdout).unwrap_or_default();
-            let profile_path = String::from_utf8(profile.stdout).unwrap_or_default();
-            booted_path.trim() != profile_path.trim()
-        }
-        _ => false,
     }
 }
 
