@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Parser};
+use futures_util::StreamExt;
 use gtk4::{
     self, gdk::RGBA, glib, Box as GtkBox, Button, FlowBox, Label, Orientation, ScrolledWindow,
-    SelectionMode,
+    SelectionMode, Spinner, TextView,
 };
 use ksni::{Category, Status, TrayMethods};
 use libadwaita::prelude::*;
@@ -22,10 +23,6 @@ use vte4::prelude::*;
 use vte4::{PtyFlags, Terminal};
 
 const ICON_NAME: &str = "system-software-update";
-
-// du walks the whole store, so stats are refreshed on their own slower timer
-// rather than on every poller tick.
-const STORE_STATS_REFRESH: Duration = Duration::from_secs(600);
 
 const SETTINGS_FILE: &str = "/etc/simple-nix-update-gui/settings.env";
 
@@ -261,6 +258,10 @@ struct UpdateState {
     last_check: String,
     flake_uri: String,
     system_name: String,
+    /// Absent when talking to a daemon that predates the field; a check from
+    /// such a daemon simply reports no progress.
+    #[serde(default)]
+    checking: bool,
 }
 
 /// What background tasks ask the GTK thread to do. The GTK thread owns every
@@ -272,9 +273,13 @@ enum UiAction {
     DaemonDown(String),
     OpenWindow,
     CheckNow,
+    CheckStarted,
+    CheckProgress(String),
     Quit,
 }
 
+// Manual check and catch-up requests stay as separate inputs to the poller's
+// select loop so a straggler check line can never start a new eval.
 struct UpdateTray {
     has_update: Arc<AtomicBool>,
     actions: UnboundedSender<UiAction>,
@@ -361,6 +366,10 @@ struct Window {
     store_size_label: Label,
     disk_free_label: Label,
     disk_total_label: Label,
+    check_button: Button,
+    spinner: Spinner,
+    progress_view: TextView,
+    progress_scroller: ScrolledWindow,
     rebuild_buttons: Vec<Button>,
 }
 
@@ -391,6 +400,12 @@ async fn main() -> Result<()> {
 
     let (actions_tx, actions_rx) = unbounded_channel::<UiAction>();
     let (check_tx, check_rx) = unbounded_channel::<()>();
+    let (catchup_tx, catchup_rx) = unbounded_channel::<()>();
+    // Set by the GTK thread when the progress display opens and cleared when
+    // it closes, so the progress listener knows whether a daemon initiated
+    // check has already been picked up.
+    let check_active = Arc::new(AtomicBool::new(false));
+    let (stats_tx, stats_rx) = unbounded_channel::<()>();
 
     let app = AdwApplication::new(Some("org.simple_nix_update_gui"), Default::default());
     // In tray mode the process has to outlive its window, and the guard has to
@@ -417,25 +432,32 @@ async fn main() -> Result<()> {
         None
     };
 
-    spawn_poller(settings.clone(), actions_tx.clone(), check_rx, tray_handle);
-    spawn_store_stats(actions_tx.clone());
+    spawn_store_stats(actions_tx.clone(), stats_rx);
+    spawn_poller(
+        settings.clone(),
+        actions_tx.clone(),
+        check_rx,
+        catchup_rx,
+        tray_handle,
+        stats_tx,
+    );
+    spawn_progress_listener(
+        settings.bus_name.clone(),
+        actions_tx.clone(),
+        check_active.clone(),
+        catchup_tx,
+    );
 
     let ui = Rc::new(RefCell::new(None::<Window>));
     let activate_ui = ui.clone();
     let activate_app = app.clone();
     let activate_settings = settings.clone();
-    let activate_check_tx = check_tx.clone();
     let activate_actions = actions_tx.clone();
     let start_hidden = settings.tray;
 
     app.connect_activate(move |_| {
         if activate_ui.borrow().is_none() {
-            let window = build_window(
-                &activate_app,
-                &activate_settings,
-                &activate_check_tx,
-                &activate_actions,
-            );
+            let window = build_window(&activate_app, &activate_settings, &activate_actions);
             *activate_ui.borrow_mut() = Some(window);
         }
         if !start_hidden {
@@ -447,10 +469,11 @@ async fn main() -> Result<()> {
 
     let poll_ui = ui.clone();
     let poll_app = app.clone();
+    let poll_active = check_active.clone();
     let mut actions_rx = actions_rx;
     glib::timeout_add_local(Duration::from_millis(200), move || {
         while let Ok(action) = actions_rx.try_recv() {
-            apply_action(action, &poll_ui, &poll_app, &check_tx);
+            apply_action(action, &poll_ui, &poll_app, &check_tx, &poll_active);
         }
         glib::ControlFlow::Continue
     });
@@ -464,11 +487,14 @@ fn apply_action(
     ui: &Rc<RefCell<Option<Window>>>,
     app: &AdwApplication,
     check_tx: &UnboundedSender<()>,
+    check_active: &Arc<AtomicBool>,
 ) {
     match action {
-        UiAction::State(state) => show_state(ui, &state),
+        UiAction::State(state) => show_state(ui, &state, check_active),
         UiAction::StoreStats(stats) => show_store_stats(ui, &stats),
-        UiAction::DaemonDown(reason) => show_daemon_down(ui, &reason),
+        UiAction::DaemonDown(reason) => {
+            show_daemon_down(ui, &reason, check_active);
+        }
         UiAction::OpenWindow => {
             let borrowed = ui.borrow();
             if let Some(window) = borrowed.as_ref() {
@@ -476,7 +502,27 @@ fn apply_action(
             }
         }
         UiAction::CheckNow => {
+            // Opening the display here gives the click feedback before the
+            // poller picks the request up, and marks the check as picked up so
+            // the progress listener does not also wake the poller.
+            let borrowed = ui.borrow();
+            if let Some(window) = borrowed.as_ref() {
+                start_check_display(window, true, check_active);
+            }
+            drop(borrowed);
             let _ = check_tx.send(());
+        }
+        UiAction::CheckStarted => {
+            let borrowed = ui.borrow();
+            if let Some(window) = borrowed.as_ref() {
+                start_check_display(window, true, check_active);
+            }
+        }
+        UiAction::CheckProgress(line) => {
+            let borrowed = ui.borrow();
+            if let Some(window) = borrowed.as_ref() {
+                append_progress(window, &line, check_active);
+            }
         }
         UiAction::Quit => {
             app.quit();
@@ -484,27 +530,75 @@ fn apply_action(
     }
 }
 
-fn show_state(ui: &Rc<RefCell<Option<Window>>>, state: &UpdateState) {
+/// Clears the progress pane and spins the button until the check reports its
+/// result. A repeated start keeps the pane as it is, so a start that follows
+/// already delivered lines does not wipe them.
+fn start_check_display(window: &Window, clear: bool, check_active: &Arc<AtomicBool>) {
+    check_active.store(true, Ordering::Relaxed);
+    if clear {
+        window.progress_view.buffer().set_text("");
+    }
+    window.progress_scroller.set_visible(true);
+    window.spinner.set_visible(true);
+    window.spinner.start();
+    window.check_button.set_sensitive(false);
+}
+
+fn end_check_display(window: &Window, check_active: &Arc<AtomicBool>) {
+    check_active.store(false, Ordering::Relaxed);
+    window.spinner.stop();
+    window.spinner.set_visible(false);
+    window.progress_scroller.set_visible(false);
+    window.check_button.set_sensitive(true);
+}
+
+fn append_progress(window: &Window, line: &str, check_active: &Arc<AtomicBool>) {
+    if !window.progress_scroller.is_visible() {
+        start_check_display(window, true, check_active);
+    }
+    let buffer = window.progress_view.buffer();
+    let mut end = buffer.end_iter();
+    buffer.insert(&mut end, &format!("{line}\n"));
+    let mut end = buffer.end_iter();
+    window.progress_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+}
+
+fn show_state(
+    ui: &Rc<RefCell<Option<Window>>>,
+    state: &UpdateState,
+    check_active: &Arc<AtomicBool>,
+) {
     let borrowed = ui.borrow();
     let Some(window) = borrowed.as_ref() else {
         return;
     };
 
+    // A check in flight owns the progress display; a settled state closes it.
+    if state.checking {
+        start_check_display(window, false, check_active);
+    } else {
+        end_check_display(window, check_active);
+    }
+
     // Both fields are None only in the initial state the daemon serves before
     // its first eval finishes, so this is the exact "no result yet" signal.
     let no_result = state.remote_system.is_none() && state.last_error.is_none();
     if no_result {
-        window
-            .banner
-            .set_title("No daemon result yet, waiting for the first check");
+        window.banner.set_title(if state.checking {
+            "Checking for updates"
+        } else {
+            "No daemon result yet, waiting for the first check"
+        });
         window.banner.set_revealed(true);
         window
             .current_label
             .set_text(&format!("Current: {}", state.current_system));
         window.remote_label.set_text("Remote: (none)");
-        window
-            .status_label
-            .set_text("Status: waiting for first check");
+        window.status_label.set_text(if state.checking {
+            "Status: checking for updates"
+        } else {
+            "Status: waiting for first check"
+        });
         window.last_check_label.set_text("Last check: never");
         set_rebuild_buttons(&window.rebuild_buttons, false);
         return;
@@ -523,7 +617,9 @@ fn show_state(ui: &Rc<RefCell<Option<Window>>>, state: &UpdateState) {
     }
     window.status_label.set_text(&format!(
         "Status: {}",
-        if state.remote_system.is_none() {
+        if state.checking {
+            "checking for updates"
+        } else if state.remote_system.is_none() {
             "Check failed"
         } else if state.has_update {
             "Update available"
@@ -543,7 +639,11 @@ fn set_rebuild_buttons(buttons: &[Button], sensitive: bool) {
     }
 }
 
-fn show_daemon_down(ui: &Rc<RefCell<Option<Window>>>, reason: &str) {
+fn show_daemon_down(
+    ui: &Rc<RefCell<Option<Window>>>,
+    reason: &str,
+    check_active: &Arc<AtomicBool>,
+) {
     let borrowed = ui.borrow();
     let Some(window) = borrowed.as_ref() else {
         return;
@@ -554,6 +654,8 @@ fn show_daemon_down(ui: &Rc<RefCell<Option<Window>>>, reason: &str) {
         "Status: update daemon unavailable ({reason}), using local settings"
     ));
     set_rebuild_buttons(&window.rebuild_buttons, false);
+    // A failed connection also ends any check display the daemon had open.
+    end_check_display(window, check_active);
 }
 
 fn show_store_stats(ui: &Rc<RefCell<Option<Window>>>, stats: &Result<Box<StoreStats>, String>) {
@@ -592,7 +694,6 @@ fn show_store_stats(ui: &Rc<RefCell<Option<Window>>>, stats: &Result<Box<StoreSt
 fn build_window(
     app: &AdwApplication,
     settings: &Settings,
-    check_tx: &UnboundedSender<()>,
     actions: &UnboundedSender<UiAction>,
 ) -> Window {
     let window = ApplicationWindow::builder()
@@ -603,14 +704,24 @@ fn build_window(
         .build();
 
     let header = HeaderBar::new();
+    let check_button = Button::builder().label("Check now").build();
+    let spinner = Spinner::new();
+    spinner.set_visible(false);
+    header.pack_start(&check_button);
+    header.pack_end(&spinner);
+    let button_actions = actions.clone();
+    check_button.connect_clicked(move |_| {
+        let _ = button_actions.send(UiAction::CheckNow);
+    });
+
     let banner = Banner::builder()
         .title("No daemon result yet, waiting for the first check")
         .build();
     banner.set_button_label(Some("Check now"));
     banner.set_revealed(true);
-    let banner_check_tx = check_tx.clone();
+    let banner_actions = actions.clone();
     banner.connect_button_clicked(move |_| {
-        let _ = banner_check_tx.send(());
+        let _ = banner_actions.send(UiAction::CheckNow);
     });
 
     let vbox = GtkBox::new(Orientation::Vertical, 12);
@@ -736,6 +847,24 @@ fn build_window(
     }
     action_box.insert(&clean_button, -1);
 
+    // The check's stderr lines land here while an eval runs. It is hidden
+    // outside a check so the window keeps its usual layout.
+    let progress_view = TextView::builder()
+        .monospace(true)
+        .editable(false)
+        .cursor_visible(false)
+        .left_margin(8)
+        .top_margin(6)
+        .right_margin(8)
+        .bottom_margin(6)
+        .build();
+    let progress_scroller = ScrolledWindow::builder()
+        .child(&progress_view)
+        .height_request(160)
+        .hexpand(true)
+        .build();
+    progress_scroller.set_visible(false);
+
     vbox.append(&flake_label);
     vbox.append(&system_label);
     vbox.append(&current_label);
@@ -746,6 +875,7 @@ fn build_window(
     vbox.append(&disk_free_label);
     vbox.append(&disk_total_label);
     vbox.append(&action_box);
+    vbox.append(&progress_scroller);
     vbox.append(&terminal_area);
 
     let view = ToolbarView::new();
@@ -782,6 +912,10 @@ fn build_window(
         store_size_label,
         disk_free_label,
         disk_total_label,
+        check_button,
+        spinner,
+        progress_view,
+        progress_scroller,
         rebuild_buttons,
     }
 }
@@ -886,6 +1020,9 @@ fn run_in_terminal(
     let terminal = Terminal::new();
     apply_gtk_theme_colors(&terminal);
     terminal.connect_child_exited(move |_, _| {
+        // The rebuild just changed /run/current-system, so the daemon is asked
+        // for a fresh check instead of waiting for the next periodic one.
+        let _ = refresh_actions.send(UiAction::CheckNow);
         let actions = refresh_actions.clone();
         glib::spawn_future_local(async move {
             refresh_store_stats(actions).await;
@@ -1069,11 +1206,18 @@ fn spawn_poller(
     settings: Settings,
     actions: UnboundedSender<UiAction>,
     mut check_rx: UnboundedReceiver<()>,
+    mut catchup_rx: UnboundedReceiver<()>,
     tray: Option<ksni::Handle<UpdateTray>>,
+    stats_tx: UnboundedSender<()>,
 ) {
     tokio::spawn(async move {
         let interval = parse_interval(&settings.check_interval);
         let mut previous: Option<bool> = None;
+        // While a check runs the daemon is polled once a second so the
+        // progress display closes when the eval ends rather than on the next
+        // hourly tick. The fast interval is only awaited when watching.
+        let mut watching = false;
+        let mut fast = tokio::time::interval(Duration::from_secs(1));
         tracing::info!(
             bus_name = %settings.bus_name,
             interval = ?interval,
@@ -1105,15 +1249,43 @@ fn spawn_poller(
                 // A manual check returns the state it just computed, so it is
                 // used directly rather than asking for it a second time.
                 let mut checked = None;
+                let mut request = None;
                 tokio::select! {
                     // The first tick is immediate, so state is shown on startup.
                     _ = ticker.tick() => {}
-                    _ = check_rx.recv() => {
+                    _ = fast.tick(), if watching => {
+                        tracing::debug!("watching a running check, querying state");
+                        match fetch_state(&proxy).await {
+                            Ok(state) => checked = Some(state),
+                            Err(error) => {
+                                tracing::error!(error = %error, "fetch_state failed");
+                                let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                                continue 'connect;
+                            }
+                        }
+                    }
+                    Some(received) = check_rx.recv() => {
+                        request = Some(received);
                         tracing::info!("manual check requested");
+                        let _ = actions.send(UiAction::CheckStarted);
                         match trigger_check(&proxy).await {
                             Ok(state) => checked = Some(state),
                             Err(error) => {
                                 tracing::error!(error = %error, "manual check failed");
+                                let _ = actions.send(UiAction::DaemonDown(error.to_string()));
+                                continue 'connect;
+                            }
+                        }
+                    }
+                    // The progress listener asks for a sync when a daemon
+                    // started a check on its own; reading state follows that
+                    // check without triggering a second one.
+                    _ = catchup_rx.recv() => {
+                        tracing::info!("daemon check in progress, catching up");
+                        match fetch_state(&proxy).await {
+                            Ok(state) => checked = Some(state),
+                            Err(error) => {
+                                tracing::error!(error = %error, "fetch_state failed");
                                 let _ = actions.send(UiAction::DaemonDown(error.to_string()));
                                 continue 'connect;
                             }
@@ -1135,6 +1307,21 @@ fn spawn_poller(
                         }
                     }
                 };
+
+                // The first sighting of a running check opens the progress
+                // display and seeds it with the lines produced so far; the
+                // seed covers lines emitted before the listener subscribed.
+                if state.checking && !watching {
+                    tracing::info!("daemon check in progress, watching for completion");
+                    let _ = actions.send(UiAction::CheckStarted);
+                    seed_progress(&proxy, &actions).await;
+                } else if request.is_some() && state.checking {
+                    // A manual check on an already running eval: the listener
+                    // has the live lines, the seed covers what it missed.
+                    seed_progress(&proxy, &actions).await;
+                }
+                watching = state.checking;
+
                 tracing::debug!(
                     has_update = state.has_update,
                     current = %state.current_system,
@@ -1174,7 +1361,15 @@ fn spawn_poller(
                         .await;
                 }
 
+                let settled = !state.checking;
                 let _ = actions.send(UiAction::State(Box::new(state)));
+
+                // One store stats refresh per completed check keeps du on the
+                // same schedule as the poller instead of its own timer. States
+                // that only watch a running check do not count as completed.
+                if settled {
+                    let _ = stats_tx.send(());
+                }
             }
         }
     });
@@ -1182,11 +1377,78 @@ fn spawn_poller(
 
 /// Sleeps until either the interval elapses or the Retry button asks for a new
 /// attempt, so a missing daemon costs one connection attempt per interval.
-async fn wait_for_retry(check_rx: &mut UnboundedReceiver<()>, interval: Duration) {
+async fn wait_for_retry(
+    check_rx: &mut UnboundedReceiver<()>,
+    interval: Duration,
+) {
     tokio::select! {
         _ = tokio::time::sleep(interval) => {}
         _ = check_rx.recv() => {}
     }
+}
+
+/// Feeds the lines of an already running check into the UI channel so a
+/// display that opens mid-check starts with what it missed.
+async fn seed_progress(proxy: &zbus::Proxy<'_>, actions: &UnboundedSender<UiAction>) {
+    let json: String = match proxy.call("GetProgress", &()).await {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(%error, "could not fetch check progress");
+            return;
+        }
+    };
+    match serde_json::from_str::<Vec<String>>(&json) {
+        Ok(lines) => {
+            for line in lines {
+                let _ = actions.send(UiAction::CheckProgress(line));
+            }
+        }
+        Err(error) => tracing::warn!(%error, "invalid progress payload"),
+    }
+}
+
+/// Forwards the daemon's CheckProgress signals to the GTK thread. The first
+/// line of a daemon initiated check also wakes the poller, which follows the
+/// check to its end; lines that arrive while a display is already open need no
+/// wake-up.
+fn spawn_progress_listener(
+    bus_name: String,
+    actions: UnboundedSender<UiAction>,
+    check_active: Arc<AtomicBool>,
+    catchup_tx: UnboundedSender<()>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let proxy = match daemon_proxy(&bus_name).await {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    tracing::debug!(%error, "progress listener waiting for the daemon");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let mut stream = match proxy.receive_signal("CheckProgress").await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "could not subscribe to check progress");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            tracing::info!("listening for check progress signals");
+            while let Some(message) = stream.next().await {
+                match message.body::<String>() {
+                    Ok(line) => {
+                        if !check_active.swap(true, Ordering::Relaxed) {
+                            let _ = catchup_tx.send(());
+                        }
+                        let _ = actions.send(UiAction::CheckProgress(line));
+                    }
+                    Err(error) => tracing::debug!(%error, "undecodable progress signal"),
+                }
+            }
+        }
+    });
 }
 
 /// notify-rust spins up its own tokio runtime on the calling thread, which
@@ -1306,11 +1568,19 @@ async fn refresh_store_stats(actions: UnboundedSender<UiAction>) {
     }
 }
 
-fn spawn_store_stats(actions: UnboundedSender<UiAction>) {
+/// Runs one refresh at startup, then waits for the poller to ask for the next
+/// one, so du walks the store once per update check instead of on its own
+/// timer. A trigger that lands while du is walking the store is served by the
+/// run already in progress, so it is dropped rather than queued up for an
+/// immediate second walk.
+fn spawn_store_stats(actions: UnboundedSender<UiAction>, mut stats_rx: UnboundedReceiver<()>) {
     tokio::spawn(async move {
         loop {
             refresh_store_stats(actions.clone()).await;
-            tokio::time::sleep(STORE_STATS_REFRESH).await;
+            while stats_rx.try_recv().is_ok() {}
+            if stats_rx.recv().await.is_none() {
+                break;
+            }
         }
     });
 }

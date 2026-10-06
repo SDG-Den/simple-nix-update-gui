@@ -1871,6 +1871,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "futures-util",
  "gtk4",
  "gtk4-sys",
  "hostname",

@@ -2,9 +2,10 @@ use anyhow::Result;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -15,6 +16,12 @@ use zbus::{dbus_interface, ConnectionBuilder};
 const EVAL_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 
 const SETTINGS_FILE: &str = "/etc/simple-nix-update-gui/settings.env";
+
+const DAEMON_PATH: &str = "/org/simple_nix_update_gui/Daemon";
+
+/// Keeps the progress buffer bounded when a noisy eval runs right up to the
+/// 300s timeout.
+const MAX_PROGRESS_LINES: usize = 500;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "simple-nix-update-gui-daemon")]
@@ -141,48 +148,130 @@ struct UpdateState {
     last_check: String,
     flake_uri: String,
     system_name: String,
+    /// True while an eval runs, so the GUI can show the check in progress.
+    /// Absent when talking to a daemon that predates the field.
+    #[serde(default)]
+    checking: bool,
 }
 
 #[derive(Clone)]
 struct Daemon {
-    state: std::sync::Arc<tokio::sync::RwLock<UpdateState>>,
+    state: std::sync::Arc<std::sync::RwLock<UpdateState>>,
     settings: Settings,
+    /// The stderr lines of the running check, so a GUI that attaches late can
+    /// catch up through GetProgress.
+    progress: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[dbus_interface(name = "org.simple_nix_update_gui.Daemon")]
 impl Daemon {
-    async fn check_for_updates(&self) -> String {
+    /// Starts a check on a background thread and returns the current state
+    /// immediately. The caller watches `checking` instead of blocking for the
+    /// whole eval, which also keeps the executor free to serve GetState. A
+    /// check that is already running is left alone.
+    async fn check_for_updates(
+        &self,
+        #[zbus(signal_context)] ctxt: zbus::SignalContext<'_>,
+    ) -> String {
         info!("Manual update check triggered");
-        match check_updates(&self.settings).await {
-            Ok(new_state) => {
-                *self.state.write().await = new_state.clone();
-                serde_json::to_string(&new_state).unwrap_or_else(|_| "{}".to_string())
-            }
-            Err(e) => {
-                error!("Update check failed: {}", e);
-                let mut failed = self.state.read().await.clone();
-                failed.has_update = false;
-                failed.remote_system = None;
-                failed.last_error = Some(e.to_string());
-                failed.last_check = chrono::Local::now().to_rfc3339();
-                *self.state.write().await = failed.clone();
-                serde_json::to_string(&failed).unwrap_or_else(|_| "{}".to_string())
-            }
+        if self.try_begin_check() {
+            let daemon = self.clone();
+            let ctxt = ctxt.to_owned();
+            std::thread::spawn(move || daemon.run_check(Some(ctxt), true));
+        } else {
+            info!("a check is already running, returning the current state");
         }
+        self.state_json()
     }
 
-    async fn get_state(&self) -> String {
+    fn get_state(&self) -> String {
         debug!("GetState request served");
-        let state = self.state.read().await.clone();
-        serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string())
+        self.state_json()
+    }
+
+    /// The stderr lines of the running or last check, as a JSON array.
+    fn get_progress(&self) -> String {
+        let progress = self.progress.lock().unwrap();
+        serde_json::to_string(&*progress).unwrap_or_else(|_| "[]".to_string())
     }
 
     async fn is_reboot_needed(&self) -> bool {
         is_reboot_needed().await.unwrap_or(false)
     }
+
+    /// One line of the eval's stderr, pushed while the check runs.
+    #[dbus_interface(signal)]
+    async fn check_progress(ctxt: &zbus::SignalContext<'_>, line: &str) -> zbus::Result<()>;
 }
 
-async fn get_current_system() -> Result<String> {
+impl Daemon {
+    fn state_json(&self) -> String {
+        let state = self.state.read().unwrap();
+        serde_json::to_string(&*state).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Marks a check as started unless one is already running. The buffer is
+    /// cleared only when a check actually begins, so an already running check
+    /// keeps the lines it has produced.
+    fn try_begin_check(&self) -> bool {
+        let mut state = self.state.write().unwrap();
+        if state.checking {
+            return false;
+        }
+        state.checking = true;
+        self.progress.lock().unwrap().clear();
+        true
+    }
+
+    /// Blocks until the eval finishes. Runs on a plain thread: emitting the
+    /// progress signals needs a block_on, which would panic on the zbus
+    /// executor and on the tokio runtime.
+    fn run_check(&self, ctxt: Option<zbus::SignalContext<'static>>, surface_errors: bool) {
+        let progress = self.progress.clone();
+        let outcome = check_updates(&self.settings, |line| {
+            {
+                let mut buffer = progress.lock().unwrap();
+                buffer.push(line.clone());
+                if buffer.len() > MAX_PROGRESS_LINES {
+                    buffer.remove(0);
+                }
+            }
+            if let Some(ctxt) = &ctxt {
+                if let Err(error) = zbus::block_on(Self::check_progress(ctxt, &line)) {
+                    debug!(%error, "could not emit progress signal");
+                }
+            }
+        });
+        let mut state = self.state.write().unwrap();
+        state.checking = false;
+        match outcome {
+            Ok(new_state) => *state = new_state,
+            Err(error) => {
+                error!("Update check failed: {}", error);
+                // Periodic and startup failures only get logged, as before;
+                // manual checks record the reason for the GUI.
+                if surface_errors {
+                    state.has_update = false;
+                    state.remote_system = None;
+                    state.last_error = Some(error.to_string());
+                    state.last_check = chrono::Local::now().to_rfc3339();
+                }
+            }
+        }
+    }
+}
+
+fn check_signal_context(conn: &zbus::Connection) -> Option<zbus::SignalContext<'static>> {
+    match zbus::SignalContext::new(conn, DAEMON_PATH) {
+        Ok(ctxt) => Some(ctxt.into_owned()),
+        Err(error) => {
+            warn!(%error, "could not create progress signal context");
+            None
+        }
+    }
+}
+
+fn get_current_system() -> Result<String> {
     // /run/booted-system is frozen at boot and ignores `nixos-rebuild switch`,
     // so the active system, the one nixos-rebuild just activated, is read here.
     let output = Command::new("readlink")
@@ -200,18 +289,18 @@ async fn get_current_system() -> Result<String> {
     }
 }
 
-async fn get_hostname() -> String {
+fn get_hostname() -> String {
     hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string()
 }
 
-async fn check_updates(settings: &Settings) -> Result<UpdateState> {
-    let current_system = get_current_system().await?;
+fn check_updates(settings: &Settings, mut on_line: impl FnMut(String)) -> Result<UpdateState> {
+    let current_system = get_current_system()?;
     let system_name = match settings.system_name.clone() {
         Some(name) => name,
-        None => get_hostname().await,
+        None => get_hostname(),
     };
 
     info!(
@@ -227,7 +316,8 @@ async fn check_updates(settings: &Settings) -> Result<UpdateState> {
         system_name
     );
 
-    let (has_update, remote_system, last_error) = match eval_remote_system(eval_cmd) {
+    let (has_update, remote_system, last_error) = match eval_remote_system(eval_cmd, &mut on_line)
+    {
         Ok(remote) => {
             let has_update = remote != current_system;
             info!(
@@ -250,21 +340,30 @@ async fn check_updates(settings: &Settings) -> Result<UpdateState> {
         last_check: chrono::Local::now().to_rfc3339(),
         flake_uri: settings.flake_uri.clone(),
         system_name,
+        checking: false,
     })
 }
 
 /// Runs the eval the check hinges on and returns the remote system store path,
-/// or the reason it could not be had. Lossy decoding keeps a stray non UTF-8
-/// byte in nix's output from hiding the message that matters.
+/// or the reason it could not be had. Every stderr line is handed to `on_line`
+/// as it arrives, so a caller can show the eval while it runs. Lossy decoding
+/// keeps a stray non UTF-8 byte in nix's output from hiding the message that
+/// matters.
 ///
 /// This stays on std rather than tokio on purpose. zbus dispatches method calls
 /// on its own executor, not on the runtime #[tokio::main] builds, so a tokio
 /// timer or spawn_blocking here panics with "no reactor running" whenever the
 /// check is entered over D-Bus.
-fn eval_remote_system(eval_cmd: String) -> Result<String, String> {
-    let (sender, receiver) = mpsc::channel();
+fn eval_remote_system(
+    eval_cmd: String,
+    mut on_line: impl FnMut(String),
+) -> Result<String, String> {
+    let (result_tx, result_rx) =
+        mpsc::channel::<Result<(ExitStatus, Vec<u8>, String), String>>();
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+
     std::thread::spawn(move || {
-        let outcome = Command::new("nix")
+        let mut child = match Command::new("nix")
             .arg("eval")
             .arg("--no-write-lock-file")
             // An unlocked git+ URL is re-resolved only once per tarball-ttl
@@ -275,24 +374,80 @@ fn eval_remote_system(eval_cmd: String) -> Result<String, String> {
             .arg("0")
             .arg("--raw")
             .arg(eval_cmd)
-            .output();
-        let _ = sender.send(outcome);
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = result_tx.send(Err(format!("could not run nix eval: {error}")));
+                return;
+            }
+        };
+
+        // stdout holds only the resulting store path, so reading stderr to
+        // completion first cannot deadlock on a full stdout pipe.
+        let mut stderr_lines = Vec::new();
+        if let Some(stderr) = child.stderr.take() {
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(line) => {
+                        let _ = line_tx.send(line.clone());
+                        stderr_lines.push(line);
+                    }
+                    Err(error) => {
+                        stderr_lines.push(format!("unreadable stderr: {error}"));
+                        break;
+                    }
+                }
+            }
+        }
+        let mut stdout = Vec::new();
+        if let Some(mut piped) = child.stdout.take() {
+            let _ = piped.read_to_end(&mut stdout);
+        }
+        match child.wait() {
+            Ok(status) => {
+                let _ = result_tx.send(Ok((status, stdout, stderr_lines.join("\n"))));
+            }
+            Err(error) => {
+                let _ = result_tx.send(Err(format!("waiting for nix eval: {error}")));
+            }
+        }
     });
 
-    let output = match receiver.recv_timeout(EVAL_TIMEOUT) {
-        Ok(outcome) => outcome.map_err(|e| format!("could not run nix eval: {e}"))?,
-        Err(RecvTimeoutError::Timeout) => {
-            return Err(format!("nix eval did not finish within {EVAL_TIMEOUT:?}"));
+    let deadline = Instant::now() + EVAL_TIMEOUT;
+    loop {
+        match result_rx.recv_timeout(StdDuration::from_millis(50)) {
+            Ok(Ok((status, stdout, stderr))) => {
+                drain_progress(&line_rx, &mut on_line);
+                return if status.success() {
+                    Ok(text(&stdout))
+                } else {
+                    Err(text(stderr.as_bytes()))
+                };
+            }
+            Ok(Err(error)) => {
+                drain_progress(&line_rx, &mut on_line);
+                return Err(error);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                drain_progress(&line_rx, &mut on_line);
+                if Instant::now() >= deadline {
+                    return Err(format!("nix eval did not finish within {EVAL_TIMEOUT:?}"));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                drain_progress(&line_rx, &mut on_line);
+                return Err("nix eval thread ended without a result".to_string());
+            }
         }
-        Err(RecvTimeoutError::Disconnected) => {
-            return Err("nix eval thread ended without a result".to_string());
-        }
-    };
+    }
+}
 
-    if output.status.success() {
-        Ok(text(&output.stdout))
-    } else {
-        Err(text(&output.stderr))
+fn drain_progress(line_rx: &mpsc::Receiver<String>, on_line: &mut impl FnMut(String)) {
+    while let Ok(line) = line_rx.try_recv() {
+        on_line(line);
     }
 }
 
@@ -340,7 +495,7 @@ async fn main() -> Result<()> {
     // The name is taken before the first nix eval. Under Type=dbus systemd waits
     // for the name, and a cold eval of a large flake can outlast that wait.
     let daemon = Daemon {
-        state: std::sync::Arc::new(tokio::sync::RwLock::new(UpdateState {
+        state: std::sync::Arc::new(std::sync::RwLock::new(UpdateState {
             has_update: false,
             current_system: "unknown".to_string(),
             remote_system: None,
@@ -351,27 +506,30 @@ async fn main() -> Result<()> {
                 .system_name
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string()),
+            checking: false,
         })),
         settings: settings.clone(),
+        progress: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     };
 
     // Session bus, not system bus. The daemon runs as the logged in user in a
     // systemd user unit, and needs their HOME so git can find their credentials.
-    let _conn = ConnectionBuilder::session()?
+    let conn = ConnectionBuilder::session()?
         .name(settings.bus_name.clone())?
-        .serve_at("/org/simple_nix_update_gui/Daemon", daemon.clone())?
+        .serve_at(DAEMON_PATH, daemon.clone())?
         .build()
         .await?;
     info!(bus_name = %settings.bus_name, "daemon owns bus name");
 
-    let initial_state = match check_updates(&settings).await {
-        Ok(state) => state,
-        Err(e) => {
-            error!("Initial check failed: {}", e);
-            daemon.state.read().await.clone()
+    // Checks run on plain threads: run_check emits progress signals, which
+    // needs a block_on that would panic on both the zbus executor and here.
+    let startup_daemon = daemon.clone();
+    let startup_ctxt = check_signal_context(&conn);
+    std::thread::spawn(move || {
+        if startup_daemon.try_begin_check() {
+            startup_daemon.run_check(startup_ctxt, false);
         }
-    };
-    *daemon.state.write().await = initial_state;
+    });
 
     // Periodic checks
     let duration = parse_duration(&settings.check_interval).unwrap_or(Duration::from_secs(3600));
@@ -381,13 +539,12 @@ async fn main() -> Result<()> {
     loop {
         check_interval.tick().await;
         info!("Periodic update check");
-        match check_updates(&settings).await {
-            Ok(new_state) => {
-                *daemon.state.write().await = new_state;
-            }
-            Err(e) => {
-                error!("Periodic check failed: {}", e);
-            }
+        if daemon.try_begin_check() {
+            let ctxt = check_signal_context(&conn);
+            let daemon = daemon.clone();
+            std::thread::spawn(move || daemon.run_check(ctxt, false));
+        } else {
+            info!("a check is already running, skipping this tick");
         }
     }
 }
