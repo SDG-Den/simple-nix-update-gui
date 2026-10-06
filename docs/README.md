@@ -4,7 +4,7 @@ A simple, desktop-friendly way to check for NixOS updates and perform rebuilds. 
 
 - **State daemon** (`simple-nix-update-gui-daemon`): Runs as root on the system bus, checks for system updates via `nix eval` against a flake on its own interval, and exposes state via D-Bus. It sends no notifications, because a root daemon has no session to raise them in.
 - **GUI application** (`simple-nix-update-gui`): GTK4/libadwaita interface that displays update status, sends notifications, can hide itself in a status icon, allows running `nixos-rebuild` with different actions (build/boot/switch), and optionally pipes build output through `nix-output-monitor` (nom).
-- **NixOS module**: Provides the systemd service, D-Bus service and policy files, launcher and autostart entries, and polkit rules.
+- **NixOS module**: Provides the systemd service, D-Bus service and policy files, launcher entry, tray user service, and polkit rules.
 
 ## Features
 
@@ -12,7 +12,7 @@ A simple, desktop-friendly way to check for NixOS updates and perform rebuilds. 
 - Periodic automatic update checking with configurable interval, no timer unit needed
 - Desktop notifications via `notify-rust`, once per `no update -> update` transition
 - Status icon (`ksni`) with Open, Check now, and Quit, and close-to-tray behavior
-- Desktop launcher entry and `xdg/autostart` entry, both carrying every setting as a flag
+- Desktop launcher entry and a tray systemd user service, both carrying every setting as a flag
 - Integrated terminal showing rebuild output (VTE)
 - `pkexec` for `nixos-rebuild boot`/`switch`, so a polkit agent can ask for the password
 - Optional `nix-output-monitor` (nom) support for nicer build logs

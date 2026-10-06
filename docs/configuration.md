@@ -4,7 +4,7 @@ The application is configured via CLI arguments, environment variables, a
 system-wide settings file, or builtin defaults, in that order of precedence.
 The NixOS module writes the settings file to
 `/etc/simple-nix-update-gui/settings.env`, so any way of starting the GUI
-(terminal, desktop entry, tray autostart) uses the same values. Every binary
+(terminal, desktop entry, tray user service) uses the same values. Every binary
 logs each setting with its source on startup.
 
 ### Configuration sources
@@ -60,11 +60,12 @@ false, because both binaries fall back to `true` when a value is absent. Use
 | `services.simple-nix-update-gui.checkInterval` | str | `"1h"` | Check interval, used by the daemon's own loop and by the GUI's poll interval |
 | `services.simple-nix-update-gui.autoNotify` | bool | `true` | Let the GUI notify when an update becomes available |
 | `services.simple-nix-update-gui.useNom` | bool | `true` | Use nom in integrated terminal |
-| `services.simple-nix-update-gui.trayAutostart` | bool | `true` | Add the `xdg/autostart` entry that starts the GUI with `--tray` |
+| `services.simple-nix-update-gui.trayAutostart` | bool | `true` | Start the GUI with `--tray` as a systemd user service that restarts on failure |
 | `services.simple-nix-update-gui.clonePath` | str | `"$HOME/repos/nix-config"` | Local directory the GUI clones or pulls (as the invoking user, before any sudo) when `flakeUri` is a `git+` URI, then rebuilds from |
 
-The module starts the daemon through a `systemd.user` unit, adds the tray
-autostart and launcher desktop entries, writes
+The module starts the daemon through a `systemd.user` unit, adds the launcher
+desktop entry and, when `trayAutostart` is on, a tray systemd user service that
+restarts on failure, writes
 `/etc/simple-nix-update-gui/settings.env`, and adds a polkit rule that lets the
 `wheel` group reboot and power off without a password prompt.
 

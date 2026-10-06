@@ -13,22 +13,48 @@ with lib; let
     then config.networking.hostName
     else cfg.systemName;
 
-  # Values are quoted because these flags end up in the Exec line of a desktop
-  # entry, where the Desktop Entry Specification lists ?, #, and & as reserved
-  # characters. Flake URIs use them, for example git+https://host/repo?ref=main.
-  flag = name: value: "--${name}=\"${value}\"";
-
-  # One rendering of every setting, shared by the launcher entry and the tray
-  # entry, so no binary can be launched with a partial set.
-  cliFlags = concatStringsSep " " [
-    (flag "flake-uri" cfg.flakeUri)
-    (flag "system-name" systemName)
-    (flag "use-nom" (boolToString cfg.useNom))
-    (flag "auto-notify" (boolToString cfg.autoNotify))
-    (flag "check-interval" cfg.checkInterval)
-    (flag "bus-name" cfg.busName)
-    (flag "clone-path" cfg.clonePath)
+  # One source for every setting, rendered below for each way a binary is
+  # started, so no launch can carry a partial set.
+  settings = [
+    {
+      name = "flake-uri";
+      value = cfg.flakeUri;
+    }
+    {
+      name = "system-name";
+      value = systemName;
+    }
+    {
+      name = "use-nom";
+      value = boolToString cfg.useNom;
+    }
+    {
+      name = "auto-notify";
+      value = boolToString cfg.autoNotify;
+    }
+    {
+      name = "check-interval";
+      value = cfg.checkInterval;
+    }
+    {
+      name = "bus-name";
+      value = cfg.busName;
+    }
+    {
+      name = "clone-path";
+      value = cfg.clonePath;
+    }
   ];
+
+  # Quoted because these flags end up in the Exec line of a desktop entry,
+  # where the Desktop Entry Specification lists ?, #, and & as reserved
+  # characters. Flake URIs use them, for example git+https://host/repo?ref=main.
+  cliFlags = concatStringsSep " " (map (setting: "--${setting.name}=\"${setting.value}\"") settings);
+
+  # systemd reliably strips quotes only when they wrap a whole argument (the
+  # form systemd-xdg-autostart-generator emits), so the user unit quotes each
+  # flag in full instead of reusing the desktop entry rendering.
+  unitFlags = concatStringsSep " " (map (setting: "\"--${setting.name}=${setting.value}\"") settings);
 
   # Booleans are always written out, including when false, because both binaries
   # fall back to true when a variable is absent.
@@ -42,12 +68,15 @@ with lib; let
     "SNU_CLONE_PATH=${cfg.clonePath}"
   ];
 
+  # ionice comes from util-linux: the tray unit's du walk runs through it at
+  # idle I/O priority so the scan does not compete with the desktop.
   daemonPath = concatStringsSep ":" [
     "${pkgs.nix}/bin"
     "${pkgs.git}/bin"
     "${pkgs.nix-output-monitor}/bin"
     "${pkgs.openssh}/bin"
     "${pkgs.coreutils}/bin"
+    "${pkgs.util-linux}/bin"
     "${pkgs.bash}/bin"
     "$PATH"
   ];
@@ -156,23 +185,8 @@ in
     # daemon. Both binaries resolve flag, then env, then this file, then
     # hardcoded defaults. The daemon unit still passes the values as env too;
     # the file is the fallback for every other way of starting the GUI.
-    environment.etc =
-      {
-        "simple-nix-update-gui/settings.env".text = lib.concatStringsSep "\n" (settingsEnv ++ [""]);
-      }
-      // optionalAttrs cfg.trayAutostart {
-        # makeDesktopItem builds a directory; etc sources the .desktop file out
-        # of it so the autostart dir gets a regular file the generator can parse.
-        "xdg/autostart/simple-nix-update-gui-tray.desktop".source =
-          "${pkgs.makeDesktopItem {
-            name = "simple-nix-update-gui-tray";
-            exec = "${gui}/bin/simple-nix-update-gui ${cliFlags} --tray";
-            desktopName = "Simple Nix Update GUI";
-            icon = "system-software-update";
-            comment = "Tray icon for the Simple NixOS update GUI";
-            terminal = false;
-          }}/share/applications/simple-nix-update-gui-tray.desktop";
-      };
+    environment.etc."simple-nix-update-gui/settings.env".text =
+      lib.concatStringsSep "\n" (settingsEnv ++ [""]);
 
     # A user unit, not a system one, so it runs as whoever logged in. That is
     # what lets the eval reach a private flake: nix shells out to git, which
@@ -199,6 +213,33 @@ in
             "RUST_BACKTRACE=1"
           ];
         ExecStart = "${daemon}/bin/simple-nix-update-gui-daemon";
+      };
+    };
+
+    # The tray is a user unit, not an XDG autostart entry: an autostart entry
+    # runs once at login with no restart, so starting before the desktop's
+    # StatusNotifierWatcher exists (DMS/quickshell on mango, the appindicator
+    # extension on GNOME) lost the tray for the whole session whenever the
+    # spawn lost that race. Restart covers the remaining failure modes, and
+    # PartOf/After ties the unit to the compositor's session target.
+    systemd.user.services.simple-nix-update-gui-tray = mkIf cfg.trayAutostart {
+      description = "Simple Nix update GUI tray icon";
+      wantedBy = ["default.target"];
+      unitConfig = {
+        StartLimitIntervalSec = "600";
+        StartLimitBurst = 30;
+        PartOf = "graphical-session.target";
+        After = "graphical-session.target";
+      };
+      serviceConfig = {
+        Restart = "on-failure";
+        RestartSec = "10s";
+        Environment =
+          settingsEnv
+          ++ [
+            "PATH=${daemonPath}"
+          ];
+        ExecStart = "${gui}/bin/simple-nix-update-gui ${unitFlags} --tray";
       };
     };
 

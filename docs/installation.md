@@ -32,8 +32,8 @@ Add the flake to your inputs and enable the module:
 This will:
 - Install the GUI and `nix-output-monitor` packages
 - Add a launcher entry that opens the window, with every setting passed as a flag
-- Add an `xdg/autostart` entry that starts the tray icon with the session, unless
-  `trayAutostart` is set to false
+- Start the tray icon as a systemd user service with the session, restarting it
+  on failure, unless `trayAutostart` is set to false
 - Register the D-Bus service and policy files on the system bus
 - Start the daemon as a systemd service that owns the bus name, checks once at
   startup, and then checks on `checkInterval` from its own loop

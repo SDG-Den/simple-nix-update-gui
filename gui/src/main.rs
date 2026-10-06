@@ -17,7 +17,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use vte4::prelude::*;
 use vte4::{PtyFlags, Terminal};
@@ -279,6 +279,7 @@ enum UiAction {
     CheckNow,
     CheckStarted,
     CheckProgress(String),
+    RefreshStoreStats,
     Quit,
 }
 
@@ -323,6 +324,18 @@ impl ksni::Tray for UpdateTray {
 
     fn category(&self) -> Category {
         Category::SystemServices
+    }
+
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        tracing::warn!(
+            ?reason,
+            "StatusNotifierWatcher offline, tray icon appears when it comes up"
+        );
+        true
+    }
+
+    fn watcher_online(&self) {
+        tracing::info!("StatusNotifierWatcher online, tray icon registered");
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -417,6 +430,9 @@ async fn main() -> Result<()> {
     // check has already been picked up.
     let check_active = Arc::new(AtomicBool::new(false));
     let (stats_tx, stats_rx) = unbounded_channel::<()>();
+    // Set by the window's map/unmap signals; the stats task uses it so the
+    // du walk only happens while someone can see the number it produces.
+    let window_visible = Arc::new(AtomicBool::new(false));
 
     let app = AdwApplication::new(Some("org.simple_nix_update_gui"), Default::default());
     // In tray mode the process has to outlive its window, and the guard has to
@@ -432,7 +448,11 @@ async fn main() -> Result<()> {
             has_update: Arc::new(AtomicBool::new(false)),
             actions: actions_tx.clone(),
         };
-        let handle = tray.spawn().await?;
+        // The session can call this at login before the desktop's
+        // StatusNotifierWatcher (DMS, GNOME appindicator) exists. With
+        // assume_sni_available that failure becomes a soft error: spawn
+        // succeeds anyway and ksni registers itself once the watcher appears.
+        let handle = tray.assume_sni_available(true).spawn().await?;
         let keeper = handle.clone();
         tokio::spawn(async move {
             let _keeper = keeper;
@@ -443,14 +463,19 @@ async fn main() -> Result<()> {
         None
     };
 
-    spawn_store_stats(actions_tx.clone(), stats_rx);
+    spawn_store_stats(
+        actions_tx.clone(),
+        stats_rx,
+        window_visible.clone(),
+        parse_interval(&settings.check_interval),
+    );
     spawn_poller(
         settings.clone(),
         actions_tx.clone(),
         check_rx,
         catchup_rx,
         tray_handle,
-        stats_tx,
+        stats_tx.clone(),
     );
     spawn_progress_listener(
         settings.bus_name.clone(),
@@ -464,11 +489,19 @@ async fn main() -> Result<()> {
     let activate_app = app.clone();
     let activate_settings = settings.clone();
     let activate_actions = actions_tx.clone();
+    let activate_stats = stats_tx.clone();
+    let activate_visible = window_visible.clone();
     let start_hidden = settings.tray;
 
     app.connect_activate(move |_| {
         if activate_ui.borrow().is_none() {
-            let window = build_window(&activate_app, &activate_settings, &activate_actions);
+            let window = build_window(
+                &activate_app,
+                &activate_settings,
+                &activate_actions,
+                &activate_stats,
+                &activate_visible,
+            );
             *activate_ui.borrow_mut() = Some(window);
         }
         if !start_hidden {
@@ -484,7 +517,14 @@ async fn main() -> Result<()> {
     let mut actions_rx = actions_rx;
     glib::timeout_add_local(Duration::from_millis(200), move || {
         while let Ok(action) = actions_rx.try_recv() {
-            apply_action(action, &poll_ui, &poll_app, &check_tx, &poll_active);
+            apply_action(
+                action,
+                &poll_ui,
+                &poll_app,
+                &check_tx,
+                &poll_active,
+                &stats_tx,
+            );
         }
         glib::ControlFlow::Continue
     });
@@ -499,10 +539,14 @@ fn apply_action(
     app: &AdwApplication,
     check_tx: &UnboundedSender<()>,
     check_active: &Arc<AtomicBool>,
+    stats_tx: &UnboundedSender<()>,
 ) {
     match action {
         UiAction::State(state) => show_state(ui, &state, check_active),
         UiAction::StoreStats(stats) => show_store_stats(ui, &stats),
+        UiAction::RefreshStoreStats => {
+            let _ = stats_tx.send(());
+        }
         UiAction::DaemonDown(reason) => {
             show_daemon_down(ui, &reason, check_active);
         }
@@ -571,7 +615,9 @@ fn append_progress(window: &Window, line: &str, check_active: &Arc<AtomicBool>) 
     let mut end = buffer.end_iter();
     buffer.insert(&mut end, &format!("{line}\n"));
     let mut end = buffer.end_iter();
-    window.progress_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+    window
+        .progress_view
+        .scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
 }
 
 fn show_state(
@@ -678,8 +724,11 @@ fn show_store_stats(ui: &Rc<RefCell<Option<Window>>>, stats: &Result<Box<StoreSt
         Ok(stats) => {
             let store_pct = percent_of(stats.store_bytes, stats.disk_total_bytes);
             let free_pct = percent_of(stats.disk_free_bytes, stats.disk_total_bytes);
+            // The database estimate stands in until a du walk finishes, so it
+            // carries a tilde to mark it as approximate.
+            let marker = if stats.accurate { "" } else { "~" };
             window.store_size_label.set_text(&format!(
-                "Nix store: {} ({}% of disk)",
+                "Nix store: {marker}{} ({}% of disk)",
                 format_gb(stats.store_bytes),
                 store_pct
             ));
@@ -706,6 +755,8 @@ fn build_window(
     app: &AdwApplication,
     settings: &Settings,
     actions: &UnboundedSender<UiAction>,
+    stats_tx: &UnboundedSender<()>,
+    window_visible: &Arc<AtomicBool>,
 ) -> Window {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -913,6 +964,20 @@ fn build_window(
         }
     });
 
+    // Showing the window is also a stats trigger: it starts the database
+    // estimate right away and lets the du walk run now that someone can see
+    // its result, while hiding marks the walk pointless again.
+    let map_visible = window_visible.clone();
+    let map_stats = stats_tx.clone();
+    window.connect_map(move |_| {
+        map_visible.store(true, Ordering::Relaxed);
+        let _ = map_stats.send(());
+    });
+    let unmap_visible = window_visible.clone();
+    window.connect_unmap(move |_| {
+        unmap_visible.store(false, Ordering::Relaxed);
+    });
+
     Window {
         window,
         banner,
@@ -1032,12 +1097,10 @@ fn run_in_terminal(
     apply_gtk_theme_colors(&terminal);
     terminal.connect_child_exited(move |_, _| {
         // The rebuild just changed /run/current-system, so the daemon is asked
-        // for a fresh check instead of waiting for the next periodic one.
+        // for a fresh check instead of waiting for the next periodic one, and
+        // the stats task gets a trigger that respects its du throttle.
         let _ = refresh_actions.send(UiAction::CheckNow);
-        let actions = refresh_actions.clone();
-        glib::spawn_future_local(async move {
-            refresh_store_stats(actions).await;
-        });
+        let _ = refresh_actions.send(UiAction::RefreshStoreStats);
     });
     terminal.spawn_async(
         PtyFlags::DEFAULT,
@@ -1375,8 +1438,9 @@ fn spawn_poller(
                 let settled = !state.checking;
                 let _ = actions.send(UiAction::State(Box::new(state)));
 
-                // One store stats refresh per completed check keeps du on the
-                // same schedule as the poller instead of its own timer. States
+                // One store stats trigger per completed check keeps the
+                // refresh on the poller's schedule instead of its own timer;
+                // the stats task decides whether a du walk is due. States
                 // that only watch a running check do not count as completed.
                 if settled {
                     let _ = stats_tx.send(());
@@ -1388,10 +1452,7 @@ fn spawn_poller(
 
 /// Sleeps until either the interval elapses or the Retry button asks for a new
 /// attempt, so a missing daemon costs one connection attempt per interval.
-async fn wait_for_retry(
-    check_rx: &mut UnboundedReceiver<()>,
-    interval: Duration,
-) {
+async fn wait_for_retry(check_rx: &mut UnboundedReceiver<()>, interval: Duration) {
     tokio::select! {
         _ = tokio::time::sleep(interval) => {}
         _ = check_rx.recv() => {}
@@ -1506,31 +1567,19 @@ fn get_hostname() -> String {
         .to_string()
 }
 
+#[derive(Clone, Copy)]
 struct StoreStats {
     store_bytes: u64,
     disk_total_bytes: u64,
     disk_free_bytes: u64,
+    /// False while `store_bytes` is the database estimate rather than a du
+    /// walk, so the label can mark it as approximate.
+    accurate: bool,
 }
 
-/// Blocks while du walks the store, so it is only ever called from
-/// spawn_blocking. du reports on-disk usage (block allocation), df reports the
-/// size of the filesystem /nix/store lives on, which is not necessarily the
-/// root filesystem.
-fn collect_store_stats() -> Result<StoreStats> {
-    let du = Command::new("du")
-        .args(["-s", "-B1", "/nix/store"])
-        .output()
-        .context("running du")?;
-    if !du.status.success() {
-        bail!("du failed: {}", text(&du.stderr));
-    }
-    let store_bytes = text(&du.stdout)
-        .split_whitespace()
-        .next()
-        .context("du produced no output")?
-        .parse()
-        .context("du output was not a byte count")?;
-
+/// df reports the size of the filesystem /nix/store lives on, which is not
+/// necessarily the root filesystem. It is cheap enough for every refresh.
+fn collect_disk_stats() -> Result<(u64, u64)> {
     let df = Command::new("df")
         .args(["-B1", "--output=size,avail", "/nix/store"])
         .output()
@@ -1555,11 +1604,64 @@ fn collect_store_stats() -> Result<StoreStats> {
         .context("df avail column missing")?
         .parse()
         .context("df avail was not a number")?;
+    Ok((disk_total_bytes, disk_free_bytes))
+}
 
+/// True when `program` is somewhere on PATH, checked without spawning it.
+fn have_program(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| directory.join(program).is_file())
+    })
+}
+
+/// Blocks while du walks the store, so it is only ever called from
+/// spawn_blocking. The walk runs at the lowest CPU priority and, when
+/// ionice is installed, at idle I/O priority, so reading the whole store
+/// cannot compete with the desktop. du reports on-disk usage (block
+/// allocation).
+fn du_store_bytes() -> Result<u64> {
+    let mut command = if have_program("ionice") {
+        let mut command = Command::new("ionice");
+        command.args([
+            "-c",
+            "3",
+            "nice",
+            "-n",
+            "19",
+            "du",
+            "-s",
+            "-B1",
+            "/nix/store",
+        ]);
+        command
+    } else {
+        let mut command = Command::new("nice");
+        command.args(["-n", "19", "du", "-s", "-B1", "/nix/store"]);
+        command
+    };
+    let du = command.output().context("running du")?;
+    if !du.status.success() {
+        bail!("du failed: {}", text(&du.stderr));
+    }
+    let store_bytes = text(&du.stdout)
+        .split_whitespace()
+        .next()
+        .context("du produced no output")?
+        .parse()
+        .context("du output was not a byte count")?;
+    Ok(store_bytes)
+}
+
+/// The accurate numbers: du for the store plus a fresh df. The slow half of
+/// the refresh, so spawn_store_stats gates it on visibility and a throttle.
+fn collect_store_stats() -> Result<StoreStats> {
+    let store_bytes = du_store_bytes()?;
+    let (disk_total_bytes, disk_free_bytes) = collect_disk_stats()?;
     Ok(StoreStats {
         store_bytes,
         disk_total_bytes,
         disk_free_bytes,
+        accurate: true,
     })
 }
 
@@ -1578,29 +1680,131 @@ fn percent_of(part: u64, total: u64) -> u64 {
     part.saturating_mul(100) / total
 }
 
-async fn refresh_store_stats(actions: UnboundedSender<UiAction>) {
-    match tokio::task::spawn_blocking(collect_store_stats).await {
-        Ok(Ok(stats)) => {
+/// df plus a nix database estimate of the store: nix reports the summed
+/// `narSize` of every registered path straight from its database, which is
+/// seconds where a du walk of the store takes minutes. The estimate counts
+/// only registered paths, so it can differ from what du reports.
+async fn approximate_store_bytes() -> Result<u64> {
+    let output = tokio::process::Command::new("nix")
+        .args(["path-info", "--all", "--json"])
+        .output()
+        .await
+        .context("running nix path-info")?;
+    if !output.status.success() {
+        bail!("nix path-info failed: {}", text(&output.stderr));
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("nix path-info output was not JSON")?;
+    let paths = json
+        .as_array()
+        .context("nix path-info output was not a JSON array")?;
+    Ok(paths
+        .iter()
+        .filter_map(|path| path.get("narSize").and_then(|size| size.as_u64()))
+        .sum())
+}
+
+/// The fast half of a refresh: a fresh df and the database estimate, sent
+/// immediately. When the estimate fails and a previous number exists it is
+/// reused instead, so a missing nix or an unreadable database costs the tilde
+/// on the label rather than the whole row.
+async fn fast_store_stats(previous: Option<StoreStats>) -> Result<StoreStats> {
+    let (disk_total_bytes, disk_free_bytes) =
+        match tokio::task::spawn_blocking(collect_disk_stats).await {
+            Ok(disk) => disk?,
+            Err(error) => bail!("disk stats task panicked: {error}"),
+        };
+    match approximate_store_bytes().await {
+        Ok(store_bytes) => Ok(StoreStats {
+            store_bytes,
+            disk_total_bytes,
+            disk_free_bytes,
+            accurate: false,
+        }),
+        Err(error) => match previous {
+            Some(previous) => {
+                tracing::warn!(%error, "store estimate failed, reusing the last number");
+                Ok(StoreStats {
+                    store_bytes: previous.store_bytes,
+                    accurate: previous.accurate,
+                    disk_total_bytes,
+                    disk_free_bytes,
+                })
+            }
+            None => Err(error),
+        },
+    }
+}
+
+/// Sends one fast refresh and returns the stats it showed, so the next call
+/// can reuse the store number if the estimate fails again.
+async fn refresh_fast_stats(
+    actions: &UnboundedSender<UiAction>,
+    previous: Option<StoreStats>,
+) -> Option<StoreStats> {
+    match fast_store_stats(previous).await {
+        Ok(stats) => {
             let _ = actions.send(UiAction::StoreStats(Ok(Box::new(stats))));
+            Some(stats)
         }
-        Ok(Err(error)) => {
-            let _ = actions.send(UiAction::StoreStats(Err(error.to_string())));
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "store stats task panicked");
+        Err(reason) => {
+            let _ = actions.send(UiAction::StoreStats(Err(reason.to_string())));
+            None
         }
     }
 }
 
-/// Runs one refresh at startup, then waits for the poller to ask for the next
-/// one, so du walks the store once per update check instead of on its own
-/// timer. A trigger that lands while du is walking the store is served by the
+/// Sends the accurate du-based numbers. A failed walk keeps whatever the fast
+/// refresh already showed, so a store that du cannot read still gets the
+/// estimate.
+async fn refresh_accurate_stats(actions: &UnboundedSender<UiAction>) -> Option<StoreStats> {
+    match tokio::task::spawn_blocking(collect_store_stats).await {
+        Ok(Ok(stats)) => {
+            let _ = actions.send(UiAction::StoreStats(Ok(Box::new(stats))));
+            Some(stats)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "du walk failed, keeping the current store number");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "store stats task panicked");
+            None
+        }
+    }
+}
+
+/// Waits for a trigger, then refreshes only while the window is visible:
+/// nobody can see the numbers otherwise, and the expensive half is the point
+/// of the gating. Every trigger updates the disk numbers and the database
+/// estimate right away; the accurate du walk follows only when at least one
+/// check interval has passed since the last one, because it walks the whole
+/// store. Showing the window sends its own trigger, so reopening catches up
+/// immediately. A trigger that lands while a walk is running is served by the
 /// run already in progress, so it is dropped rather than queued up for an
 /// immediate second walk.
-fn spawn_store_stats(actions: UnboundedSender<UiAction>, mut stats_rx: UnboundedReceiver<()>) {
+fn spawn_store_stats(
+    actions: UnboundedSender<UiAction>,
+    mut stats_rx: UnboundedReceiver<()>,
+    window_visible: Arc<AtomicBool>,
+    du_interval: Duration,
+) {
     tokio::spawn(async move {
+        let mut latest: Option<StoreStats> = None;
+        let mut last_du: Option<Instant> = None;
         loop {
-            refresh_store_stats(actions.clone()).await;
+            if window_visible.load(Ordering::Relaxed) {
+                if let Some(stats) = refresh_fast_stats(&actions, latest).await {
+                    latest = Some(stats);
+                }
+                let du_due = last_du.is_none_or(|start| start.elapsed() >= du_interval);
+                if du_due {
+                    last_du = Some(Instant::now());
+                    if let Some(stats) = refresh_accurate_stats(&actions).await {
+                        latest = Some(stats);
+                    }
+                }
+            }
             while stats_rx.try_recv().is_ok() {}
             if stats_rx.recv().await.is_none() {
                 break;

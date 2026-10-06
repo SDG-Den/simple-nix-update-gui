@@ -69,7 +69,20 @@ cargo clippy --all-targets --all-features
 - Verify the flake URI and system name are correct
 - Check that `nix eval` works: `nix eval --raw 'flake-uri#nixosConfigurations.systemName.system'`
 - Ensure the flake is accessible (network access for remote flakes, proper paths)
-- The current/remote paths are store paths; differences indicate the evaluated system hash differs from what's booted.
+- The current/remote paths are store paths; differences indicate the evaluated system hash differs from what is booted.
+
+### Tray icon missing after login
+
+- Check the unit: `systemctl --user status simple-nix-update-gui-tray`
+- Read the log: `journalctl --user -u simple-nix-update-gui-tray -b --no-pager`
+- The desktop may register the icon late; look for `StatusNotifierWatcher offline`
+  followed by `StatusNotifierWatcher online` in that log. The icon appears once
+  the desktop's watcher (DMS/quickshell, or the GNOME appindicator extension) is up.
+- If the unit is restarting in a loop, the log shows why (typically no display
+  yet at login; `RestartSec` delays each retry until the session is ready).
+- Start it manually while debugging: `systemctl --user restart simple-nix-update-gui-tray`
+- The stale `app-simple\x2dnix\x2dupdate\x2dgui\x2dtray@autostart.service` unit from
+  the old XDG autostart entry disappears at the next login; it is no longer generated.
 
 ## License
 
