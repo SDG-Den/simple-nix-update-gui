@@ -53,11 +53,14 @@
           buildInputs = commonBuildInputs;
           # The GUI shells out to these (rebuild terminal, store stats), so
           # they travel with the binary instead of depending on the session
-          # that started it. sudo has to be the NixOS setuid wrapper: the
-          # store copy carries no setuid bit and cannot elevate.
+          # that started it. nixos-rebuild is the rebuild entrypoint, and the
+          # system profile is kept as a fallback so anything the user's normal
+          # PATH exposes (sudo, systemctl post-sudo, and so on) stays
+          # reachable. sudo must come from /run/wrappers/bin: the store copy
+          # carries no setuid bit and cannot elevate.
           postInstall = ''
             wrapProgram $out/bin/simple-nix-update-gui \
-              --prefix PATH : "${lib.makeBinPath (with pkgs; [nix git nix-output-monitor openssh coreutils util-linux bash])}:/run/wrappers/bin"
+              --prefix PATH : "${lib.makeBinPath (with pkgs; [nix git nix-output-monitor openssh coreutils util-linux bash nixos-rebuild])}:/run/current-system/sw/bin:/run/wrappers/bin"
           '';
         };
 
