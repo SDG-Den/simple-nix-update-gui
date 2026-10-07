@@ -60,7 +60,7 @@
           # carries no setuid bit and cannot elevate.
           postInstall = ''
             wrapProgram $out/bin/simple-nix-update-gui \
-              --prefix PATH : "${lib.makeBinPath (with pkgs; [nix git nix-output-monitor openssh coreutils util-linux bash nixos-rebuild])}:/run/current-system/sw/bin:/run/wrappers/bin"
+              --prefix PATH : "${lib.makeBinPath (with pkgs; [nix git nix-output-monitor openssh coreutils util-linux bash nixos-rebuild])}:/run/wrappers/bin:/run/current-system/sw/bin"
           '';
         };
 
