@@ -722,16 +722,23 @@ fn show_store_stats(ui: &Rc<RefCell<Option<Window>>>, stats: &Result<Box<StoreSt
     };
     match stats {
         Ok(stats) => {
-            let store_pct = percent_of(stats.store_bytes, stats.disk_total_bytes);
             let free_pct = percent_of(stats.disk_free_bytes, stats.disk_total_bytes);
-            // The database estimate stands in until a du walk finishes, so it
-            // carries a tilde to mark it as approximate.
-            let marker = if stats.accurate { "" } else { "~" };
-            window.store_size_label.set_text(&format!(
-                "Nix store: {marker}{} ({}% of disk)",
-                format_gb(stats.store_bytes),
-                store_pct
-            ));
+            match stats.store_bytes {
+                Some(store_bytes) => {
+                    let store_pct = percent_of(store_bytes, stats.disk_total_bytes);
+                    // The database estimate stands in until a du walk
+                    // finishes, so it carries a tilde.
+                    let marker = if stats.accurate { "" } else { "~" };
+                    window.store_size_label.set_text(&format!(
+                        "Nix store: {marker}{} ({}% of disk)",
+                        format_gb(store_bytes),
+                        store_pct
+                    ));
+                }
+                None => {
+                    window.store_size_label.set_text("Nix store: unavailable");
+                }
+            }
             window.disk_free_label.set_text(&format!(
                 "Disk free: {} ({}%)",
                 format_gb(stats.disk_free_bytes),
@@ -1569,11 +1576,13 @@ fn get_hostname() -> String {
 
 #[derive(Clone, Copy)]
 struct StoreStats {
-    store_bytes: u64,
+    /// None while neither the database estimate nor a du walk has produced a
+    /// number; the disk rows do not depend on it.
+    store_bytes: Option<u64>,
     disk_total_bytes: u64,
     disk_free_bytes: u64,
-    /// False while `store_bytes` is the database estimate rather than a du
-    /// walk, so the label can mark it as approximate.
+    /// False while the number came from the database estimate rather than a
+    /// du walk, so the label can mark it as approximate.
     accurate: bool,
 }
 
@@ -1658,7 +1667,7 @@ fn collect_store_stats() -> Result<StoreStats> {
     let store_bytes = du_store_bytes()?;
     let (disk_total_bytes, disk_free_bytes) = collect_disk_stats()?;
     Ok(StoreStats {
-        store_bytes,
+        store_bytes: Some(store_bytes),
         disk_total_bytes,
         disk_free_bytes,
         accurate: true,
@@ -1693,47 +1702,59 @@ async fn approximate_store_bytes() -> Result<u64> {
     if !output.status.success() {
         bail!("nix path-info failed: {}", text(&output.stderr));
     }
-    let json: serde_json::Value =
+    // nix prints a JSON object keyed by store path; older releases print an
+    // array of the same info objects.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Report {
+        Paths(HashMap<String, Info>),
+        List(Vec<Info>),
+    }
+    #[derive(Deserialize)]
+    struct Info {
+        #[serde(rename = "narSize", default)]
+        nar_size: u64,
+    }
+    let report: Report =
         serde_json::from_slice(&output.stdout).context("nix path-info output was not JSON")?;
-    let paths = json
-        .as_array()
-        .context("nix path-info output was not a JSON array")?;
-    Ok(paths
-        .iter()
-        .filter_map(|path| path.get("narSize").and_then(|size| size.as_u64()))
-        .sum())
+    Ok(match report {
+        Report::Paths(paths) => paths.values().map(|info| info.nar_size).sum(),
+        Report::List(list) => list.iter().map(|info| info.nar_size).sum(),
+    })
 }
 
 /// The fast half of a refresh: a fresh df and the database estimate, sent
-/// immediately. When the estimate fails and a previous number exists it is
-/// reused instead, so a missing nix or an unreadable database costs the tilde
-/// on the label rather than the whole row.
+/// immediately. When the estimate fails, the last store number is kept if
+/// there is one, so a missing nix or an unreadable database only leaves the
+/// store row stale rather than taking the disk rows with it.
 async fn fast_store_stats(previous: Option<StoreStats>) -> Result<StoreStats> {
     let (disk_total_bytes, disk_free_bytes) =
         match tokio::task::spawn_blocking(collect_disk_stats).await {
             Ok(disk) => disk?,
             Err(error) => bail!("disk stats task panicked: {error}"),
         };
-    match approximate_store_bytes().await {
-        Ok(store_bytes) => Ok(StoreStats {
-            store_bytes,
-            disk_total_bytes,
-            disk_free_bytes,
-            accurate: false,
-        }),
+    let (store_bytes, accurate) = match approximate_store_bytes().await {
+        Ok(store_bytes) => (Some(store_bytes), false),
         Err(error) => match previous {
             Some(previous) => {
                 tracing::warn!(%error, "store estimate failed, reusing the last number");
-                Ok(StoreStats {
-                    store_bytes: previous.store_bytes,
-                    accurate: previous.accurate,
-                    disk_total_bytes,
-                    disk_free_bytes,
-                })
+                (previous.store_bytes, previous.accurate)
             }
-            None => Err(error),
+            None => {
+                tracing::warn!(
+                    %error,
+                    "store estimate failed, showing the disk numbers only"
+                );
+                (None, false)
+            }
         },
-    }
+    };
+    Ok(StoreStats {
+        store_bytes,
+        disk_total_bytes,
+        disk_free_bytes,
+        accurate,
+    })
 }
 
 /// Sends one fast refresh and returns the stats it showed, so the next call

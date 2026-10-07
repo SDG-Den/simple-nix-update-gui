@@ -49,8 +49,16 @@
           version = "0.1.0";
           src = lib.cleanSource ./gui;
           cargoLock.lockFile = ./gui/Cargo.lock;
-          nativeBuildInputs = commonNativeBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs ++ [pkgs.makeWrapper];
           buildInputs = commonBuildInputs;
+          # The GUI shells out to these (rebuild terminal, store stats), so
+          # they travel with the binary instead of depending on the session
+          # that started it. sudo has to be the NixOS setuid wrapper: the
+          # store copy carries no setuid bit and cannot elevate.
+          postInstall = ''
+            wrapProgram $out/bin/simple-nix-update-gui \
+              --prefix PATH : "${lib.makeBinPath (with pkgs; [nix git nix-output-monitor openssh coreutils util-linux bash])}:/run/wrappers/bin"
+          '';
         };
 
       in {
