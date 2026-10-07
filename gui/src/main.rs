@@ -184,6 +184,12 @@ fn expand_home(path: &str) -> String {
     if path == "$HOME" || path == "~" {
         return home;
     }
+    // A relative clone path stays relative without this, and nix reads a
+    // bare flakeref like "repos/nix-flake/dendrite" as a github owner/repo
+    // reference instead of a file path.
+    if !path.starts_with('/') {
+        return format!("{}/{}", home, path);
+    }
     path.to_string()
 }
 
@@ -1109,9 +1115,10 @@ fn run_in_terminal(
         let _ = refresh_actions.send(UiAction::CheckNow);
         let _ = refresh_actions.send(UiAction::RefreshStoreStats);
     });
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     terminal.spawn_async(
         PtyFlags::DEFAULT,
-        None,
+        Some(&home),
         &["/bin/sh", "-c", command],
         &[],
         gtk4::glib::SpawnFlags::DEFAULT,
@@ -1174,6 +1181,14 @@ fn build_clean_command(
     )
 }
 
+/// The GUI can be started by the tray unit rather than from a login shell, so
+/// nothing about its environment is guaranteed beyond what the binary itself
+/// carries. Pinning HOME and the working directory keeps relative paths, git
+/// credential helpers, and flake references from resolving somewhere else.
+fn pinned_env(home: &str) -> String {
+    format!("export HOME='{home}' && cd '{home}' && ")
+}
+
 /// A git+ flake URI names a repository that a root-run nixos-rebuild cannot
 /// fetch: sudo resets HOME to /root, which holds no git credentials. So the
 /// command first clones or pulls the repository into clone_path as the
@@ -1226,6 +1241,7 @@ fn build_command(
 ) -> String {
     let (sync, flake_root) = git_sync_command(flake_uri, clone_path);
     let flake = format!("{}#{}", flake_root, system_name);
+    let home = std::env::var("HOME").unwrap_or_default();
     let rebuild = if action == "build" {
         format!("nixos-rebuild {} --flake '{}'", action, flake)
     } else {
@@ -1238,10 +1254,12 @@ fn build_command(
     };
     if use_nom {
         format!(
-            "if command -v nom >/dev/null 2>&1; then {sync}{preauth}{rebuild} 2>&1 | nom; else {sync}{rebuild} 2>&1; fi"
+            "if command -v nom >/dev/null 2>&1; then {}{sync}{preauth}{rebuild} 2>&1 | nom; else {}{sync}{rebuild} 2>&1; fi",
+            pinned_env(&home),
+            pinned_env(&home),
         )
     } else {
-        format!("{}{} 2>&1", sync, rebuild)
+        format!("{}{}{} 2>&1", pinned_env(&home), sync, rebuild)
     }
 }
 
